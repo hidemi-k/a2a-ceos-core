@@ -1,0 +1,8 @@
+[GROQ]
+GROQ_API_KEY = your_api_key_here
+
+[AZURE]
+AZURE_OPENAI_API_KEY = your_api_key_here
+AZURE_OPENAI_ENDPOINT = https://<your-azure-openai-resource>.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT  = gpt-4.1-mini
+AZURE_OPENAI_API_VERSION = 2024-03-01-preview

@@ -1,0 +1,28 @@
+# 作業用ディレクトリ
+anta_snapshots/
+backup/
+work/
+
+# Python キャッシュ
+.nicegui/
+__pycache__/
+.ipynb_checkpoints/
+
+# ログ・一時ファイル
+*.log
+*.jsonl
+*.zip
+*.pdf
+*.swp
+
+# Jupyter
+*.ipynb
+
+# work用シェル
+*.sh
+
+# 実ファイルの config は絶対にコミットしない
+config.ini
+
+# Vector Store (FAISS)
+faiss_db/
