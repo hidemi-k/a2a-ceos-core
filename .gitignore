@@ -21,8 +21,9 @@ __pycache__/
 # work用シェル
 *.sh
 
-# 実ファイルの config は絶対にコミットしない
+# コミットしない
 config.ini
+.env
 
 # Vector Store (FAISS)
 faiss_db/
