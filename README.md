@@ -2,6 +2,9 @@
 
 📘 English | 🇯🇵 [日本語はこちら](README.ja.md)
 
+> **Disclaimer**: This project is an independent OSS and is not affiliated with, endorsed by, or sponsored by Arista Networks.
+> Arista and cEOS are trademarks of Arista Networks, Inc.
+
 > **The A2A network automation platform that lets you operate Arista cEOS safely with a single natural-language sentence.**
 > Unifies NETCONF · eAPI · ANTA · XDP — from Dry-run → diff → approval → ANTA Post-Check, end to end.
 

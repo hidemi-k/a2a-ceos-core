@@ -2,6 +2,9 @@
 
 🇯🇵 日本語 | 📘 [English](README.md)
 
+> **免責事項**：本プロジェクトは独立した OSS であり、Arista Networks とは一切関係ありません。
+> Arista および cEOS は Arista Networks, Inc. の商標です。
+
 > **Arista cEOS を自然言語で安全に操作できる、A2A ネットワーク自動化プラットフォーム。**
 > NETCONF・eAPI・ANTA・XDP を統合し、Dry-run → diff → 承認 → ANTA Post-Check まで一気通貫で実行できます。
 
