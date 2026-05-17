@@ -503,25 +503,18 @@ def _classify_threat(flow: dict, drop_list: dict, qos_list: dict):
     pkts  = stats.get("packets", 0)
     drops = stats.get("dropped_packets", 0)
     block_key = f"{ip}:{port} [{proto}]"
-
-    # ── SYNスパイク判定は Go (main.go) に完全委譲 ──────────────────────────────
-    # Go側が QOS_MAP に書き込んだ事実だけを信頼する。
-    # GUI側で syn 累積値を閾値判定しない（低速攻撃の表示漏れを防ぐ）。
-    if ip in qos_list:
-        return {"kind": "SYNスパイク",
-                "detail": f"syn={syn:,} ack=0 → SYN Flood検知 (Go自動ミティゲーション済)",
-                "action": "Mitigated", "ip": ip, "port": port, "proto": proto}
-
     if block_key in drop_list or drops > 0:
         return None
-
-    # ── ポートスキャン検知は GUI側で判定（Go に対応 API なし） ─────────────────
+    if proto == "tcp" and syn > 1000 and ack == 0:
+        action = "Mitigated" if ip in qos_list else "XDP_DROP"
+        return {"kind": "SYNスパイク",
+                "detail": f"syn={syn:,} ack=0 → SYN Flood検知",
+                "action": action, "ip": ip, "port": port, "proto": proto}
     if proto == "tcp" and syn > 0 and (ack / (syn + 1)) < 0.5:
         return {"kind": "ポートスキャン疑い",
                 "detail": f"ack/syn={ack/(syn+1):.2f} ハーフオープン",
                 "action": "XDP_DROP", "ip": ip, "port": port, "proto": proto}
-
-    # ── icmp / udp 異常フロー（drop/block 提案なし・脅威ログのみ） ───────────────
+    # icmp / udp は ack/syn=0 が正常。drop/block は提案せず脅威ログのみ記録
     if proto in ("icmp", "udp") and pkts > SecurityState.PPS_FLOOD_THR:
         return {"kind": "異常フロー",
                 "detail": f"port={port} {proto.upper()} flood packets={pkts:,}",
@@ -791,6 +784,63 @@ def _parse_execute_result(result: dict) -> dict:
             "tasks":          [],
             "task_summaries": [],
             "diff":           "",
+            "logs":           [],
+        }
+
+    # ── mixed ルート: read + write の混合クエリ ────────────────────────────────
+    # _execute_mixed() が返す task_summaries には read/write 両方のサブクエリ結果が入る。
+    # read サブクエリの formatted_text を先頭に表示し、
+    # write サブクエリの task_summaries を承認待ちフローに渡す。
+    if result.get("route") == "mixed":
+        # task_summaries はトップレベルに直接入っている（Hub が設定）
+        all_tasks = result.get("task_summaries", []) or inner.get("task_summaries", [])
+
+        # read サブクエリの結果を formatted テキストとして結合
+        read_lines = []
+        for sq in all_tasks:
+            if sq.get("route") == "read":
+                _ft = sq.get("formatted_text", "") or sq.get("formatted", "")
+                _sm = sq.get("summary", "")
+                _q  = sq.get("query", "")
+                if _ft:
+                    read_lines.append(f"▶ {_q}\n{_ft}")
+                elif _sm:
+                    read_lines.append(f"▶ {_q}\n{_sm}")
+        formatted_read = "\n\n".join(read_lines)
+
+        # write サブクエリの task_summaries を NETCONF 形式に変換
+        # Hub の _execute_mixed は write サブクエリの result（NETCONF応答）を格納している
+        write_task_summaries = []
+        write_overall = "success"
+        for sq in all_tasks:
+            if sq.get("route") == "write":
+                _r = sq.get("result", {}) or {}
+                _ts = _r.get("task_summaries", [])
+                write_task_summaries.extend(_ts)
+                _st = _r.get("overall_status", _r.get("status", ""))
+                if "fail" in _st.lower() or "error" in _st.lower():
+                    write_overall = _st
+
+        is_dry_run = any(
+            ts.get("deploy_status") == "skipped"
+            for ts in write_task_summaries
+        )
+
+        sd = result.get("session_diff", {}) or {}
+
+        return {
+            "is_read":        False,
+            "is_mixed":       True,           # mixed フラグ（UI 側判定用）
+            "is_dry_run":     is_dry_run,
+            "status":         status or write_overall,
+            "summary":        summary,
+            "cmds":           [],
+            "formatted":      formatted_read,  # read サブクエリ結果を表示
+            "xml":            xml_out,
+            "tasks":          [],
+            "task_summaries": write_task_summaries,
+            "session_diff":   sd,
+            "diff":           sd.get("diff_text", ""),
             "logs":           [],
         }
 
@@ -1543,6 +1593,7 @@ def main():
                             is_read     = p["is_read"]
                             is_security = p.get("is_security", False)
                             is_verify   = p.get("is_verify",   False)   # ANTA 事後検証
+                            is_mixed    = p.get("is_mixed",    False)   # 混合クエリ
                             is_dry_run  = p["is_dry_run"]   # ★ dry_run フラグ
                             status      = p["status"]
                             summary     = p["summary"]
@@ -1573,6 +1624,45 @@ def main():
                                     and not is_verify      # ← Verify は承認フロー不要
                                     and dry_run_chk.value
                                     and (is_dry_run or has_tasks)):
+
+                                # ── mixed: read サブクエリ結果を先に表示 ──────
+                                if is_mixed and p.get("formatted"):
+                                    _mixed_fmt = p["formatted"]
+                                    _mixed_esc = (
+                                        _mixed_fmt
+                                        .replace("&", "&amp;")
+                                        .replace("<", "&lt;")
+                                        .replace(">", "&gt;")
+                                    )
+                                    with chat_col:
+                                        with ui.row().style(
+                                            "justify-content:flex-start;width:100%;margin:2px 0;"
+                                        ):
+                                            with ui.column().style("gap:3px;max-width:min(94%, 100%);"):
+                                                with ui.row().style("align-items:center;gap:6px;"):
+                                                    ui.label(
+                                                        f"agent · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                                                    ).style(f"font-size:10px;color:{C['text3']};")
+                                                    badge("success", "success")
+                                                with ui.card().style(
+                                                    f"background:{C['bg2']};border:0.5px solid {C['border2']};"
+                                                    f"border-radius:2px 12px 12px 12px;"
+                                                    f"padding:11px 14px;gap:6px;box-shadow:none;"
+                                                ):
+                                                    ui.html(
+                                                        f'<div style="'
+                                                        f'background:{C["bg3"]};'
+                                                        f'border:0.5px solid {C["border"]};'
+                                                        f'border-radius:6px;'
+                                                        f'padding:10px 12px;margin-top:4px;'
+                                                        f'font-family:{C["mono"]};'
+                                                        f'font-size:11px;line-height:1.7;'
+                                                        f'color:{C["text2"]};'
+                                                        f'white-space:pre-wrap;'
+                                                        f'overflow-y:auto;max-height:320px;">'
+                                                        + _mixed_esc + "</div>"
+                                                    )
+
                                 set_phase("awaiting_confirm")
 
                                 def _on_approve():

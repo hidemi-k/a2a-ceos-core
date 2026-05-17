@@ -451,6 +451,216 @@ async def validate_xml(req: ValidateRequest):
         return {"valid": False, "message": f"❌ XML 構文エラー: {e}"}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 混合クエリ分割（read + write が同一クエリに共存する場合）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def split_mixed_query(query: str) -> list:
+    """
+    混合クエリ（read + write が混在）を LLM でサブクエリ配列に分割する。
+
+    例:
+      "VLANの状態を確認して、VLAN ID 103 の DEV3_VLAN を作成して"
+      → [{"query": "VLANの状態を確認して",           "route": "read"},
+         {"query": "VLAN ID 103 の DEV3_VLAN を作成して", "route": "write"}]
+
+    分割不要（単一ルート）の場合は空リスト [] を返す。
+    LLM パース失敗時も空リストを返し、呼び出し元が通常フローへフォールバックする。
+    """
+    result = invoke_with_fallback(
+        llm,
+        "あなたはネットワーク操作の分類器です。\n"
+        "以下のクエリに read（参照）と write（設定変更）の両方の操作が含まれる場合、\n"
+        "それぞれを独立したサブクエリに分割し、JSON 配列のみで返してください。\n"
+        "単一操作のみの場合は空配列 [] を返してください。\n\n"
+        "【出力形式】JSON 配列のみ。前後の説明文・コードブロック記号は不要。\n"
+        '例: [{"query": "VLANの状態を確認して", "route": "read"}, '
+        '{"query": "VLAN ID 103 の DEV3_VLAN を作成して", "route": "write"}]\n\n'
+        "【分類基準】\n"
+        "  read  = デバイスの状態参照・確認（show コマンド相当）\n"
+        "  write = デバイスへの設定変更・追加・削除\n\n"
+        f"クエリ: {query}\n"
+        "回答（JSON のみ）:"
+    ).strip()
+
+    try:
+        cleaned = re.sub(r"```(?:json)?|```", "", result).strip()
+        parsed  = json.loads(cleaned)
+        if isinstance(parsed, list) and len(parsed) >= 2:
+            logger.info(f"split_mixed_query: {len(parsed)} サブクエリに分割")
+            return parsed
+    except Exception as e:
+        logger.warning(f"split_mixed_query parse error: {e} / raw={result[:200]}")
+    return []
+
+
+async def _execute_mixed(
+    trace_id: str,
+    sub_queries: list,
+    req,           # ExecuteRequest
+) -> "Response":
+    """
+    混合クエリのサブクエリを順次実行してマージしたレスポンスを返す。
+
+    実行順序:
+      read サブクエリ  → eAPI A2A (8002)  に deploy=True  で即時実行
+      write サブクエリ → NETCONF A2A (8001) に deploy=False で dry-run
+
+    /deploy フローとの互換:
+      write サブクエリの final_xml / session_diff を trace_store に保存するため、
+      承認 → /deploy/{trace_id} → 実機投入 の既存フローがそのまま使える。
+
+    複数 write サブクエリがある場合は最後の XML を採用する（将来的にはマージ）。
+    """
+    from fastapi.responses import Response
+
+    EAPI_DEFAULT_PORT = int(os.getenv("EAPI_PORT_NUM", "443"))
+    EAPI_DIFF_PORT    = int(os.getenv("EAPI_PORT_NUM", "443"))
+    EAPI_TRANSPORT    = os.getenv("EAPI_TRANSPORT", "https")
+
+    results         = []
+    xml_out         = ""
+    session_diff    = {}
+    overall_status  = "success"
+
+    for i, sq in enumerate(sub_queries):
+        sub_q     = sq.get("query", "")
+        sub_route = sq.get("route", classify_query(sub_q))
+        is_read   = (sub_route == "read")
+        logger.info(
+            f"[{trace_id}] 混合サブクエリ {i+1}/{len(sub_queries)}: "
+            f"route={sub_route} query={sub_q[:60]!r}"
+        )
+
+        payload = {
+            "query":     sub_q,
+            "device_ip": req.device.ip,
+            "username":  req.device.username,
+            "password":  req.device.password,
+            "port":      str(EAPI_DEFAULT_PORT) if is_read else req.device.port,
+            "deploy":    is_read,
+        }
+        target_url = EAPI_A2A_URL if is_read else NETCONF_A2A_URL
+
+        sub_result: dict = {}
+        for attempt in range(2):
+            try:
+                sub_result = await _forward(target_url, payload)
+                break
+            except Exception as e:
+                logger.warning(
+                    f"[{trace_id}] サブクエリ {i+1} attempt {attempt+1} 失敗: {e}"
+                )
+                if attempt < 1:
+                    await asyncio.sleep(2.0)
+                else:
+                    sub_result = {"status": "error", "summary": str(e)}
+                    overall_status = "partial_error"
+
+        # read 結果を safe 形式に整形
+        if is_read:
+            sub_safe = {
+                "query":          sub_result.get("query", sub_q),
+                "cmds":           sub_result.get("cmds", []),
+                "status":         sub_result.get("status", "unknown"),
+                "summary":        sub_result.get("summary", ""),
+                "formatted_text": sub_result.get("formatted_text", ""),
+                "formatted":      sub_result.get("formatted", ""),
+            }
+        else:
+            sub_safe = sub_result
+
+        results.append({
+            "index":          i + 1,
+            "query":          sub_q,
+            "route":          sub_route,
+            "status":         sub_result.get("status", "unknown"),
+            "summary":        sub_result.get("summary", ""),
+            "formatted_text": sub_result.get("formatted_text", ""),
+            "formatted":      sub_result.get("formatted", ""),
+            "result":         sub_safe,
+        })
+
+        # write サブクエリの XML を収集（最後の write を採用）
+        if not is_read:
+            raw = sub_result.get("result", sub_result)
+            _xml = (
+                sub_result.get("final_xml", "")
+                or sub_result.get("generated_xml", "")
+                or raw.get("final_xml", "")
+                or raw.get("generated_xml", "")
+            )
+            if not _xml:
+                for ts in sub_result.get("task_summaries", []):
+                    _fx = ts.get("final_xml") or ts.get("generated_xml", "")
+                    if _fx:
+                        _xml = _fx
+                        break
+            if _xml:
+                xml_out = _xml
+
+            # session diff（write サブクエリの XML がある場合のみ）
+            if xml_out:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        diff_resp = await client.post(
+                            f"{EAPI_SDIFF_URL}/session-diff",
+                            json={
+                                "xml_str":   xml_out,
+                                "device_ip": req.device.ip,
+                                "port":      EAPI_DIFF_PORT,
+                                "transport": EAPI_TRANSPORT,
+                                "username":  req.device.username,
+                                "password":  req.device.password,
+                            },
+                            timeout=30.0,
+                        )
+                        if diff_resp.status_code == 200:
+                            session_diff = diff_resp.json()
+                        else:
+                            session_diff = {
+                                "status": "error",
+                                "message": f"HTTP {diff_resp.status_code}",
+                                "diff_lines": [], "diff_text": "",
+                            }
+                except Exception as e:
+                    logger.warning(f"[{trace_id}] 混合 session diff スキップ: {e}")
+                    session_diff = {
+                        "status": "skipped",
+                        "message": f"session diff 取得失敗: {e}",
+                        "diff_lines": [], "diff_text": "",
+                    }
+
+    has_write = any(sq.get("route") == "write" for sq in sub_queries)
+    response = {
+        "trace_id":       trace_id,
+        "route":          "mixed",
+        "is_read":        not has_write,  # write があれば deploy 可能
+        "status":         overall_status,
+        "summary":        f"混合クエリ {len(sub_queries)} 件実行完了",
+        "task_summaries": results,        # UI の既存 task_summaries 表示と互換
+        "xml":            xml_out,
+        "session_diff":   session_diff,
+        "result":         {"task_summaries": results},
+    }
+
+    _trace_store[trace_id] = {
+        **response,
+        "device":      req.device.model_dump(),
+        "query":       req.query,
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    logger.info(
+        f"[{trace_id}] 混合クエリ完了: status={overall_status} "
+        f"sub={len(sub_queries)} has_write={has_write}"
+    )
+    return Response(
+        content=json.dumps(response, ensure_ascii=True),
+        media_type="application/json",
+    )
+
+
 # ── POST /execute ─────────────────────────────────────────────────────────────
 @rest_app.post("/execute", tags=["netconf"])
 async def execute(req: ExecuteRequest):
@@ -462,6 +672,21 @@ async def execute(req: ExecuteRequest):
     trace_id = str(uuid.uuid4())[:8]
     route    = classify_query(req.query)
     logger.info(f"[{trace_id}] /execute: {req.query!r} route={route}")
+
+    # ── 混合クエリ検出: classify_query が read を返したが WRITE_KEYWORDS も含む場合 ──
+    # 例: "VLANの状態を確認して、VLAN 103 を作成して"
+    #     → classify_query は read/write 競合で "read" を返すが、
+    #       WRITE_KEYWORDS が含まれるため LLM で分割を試みる
+    if route == "read":
+        _q_lower = req.query.lower()
+        if any(k in _q_lower for k in WRITE_KEYWORDS):
+            _sub_queries = split_mixed_query(req.query)
+            if _sub_queries:
+                logger.info(
+                    f"[{trace_id}] 混合クエリ検出: "
+                    f"{len(_sub_queries)} サブクエリに分割して順次実行"
+                )
+                return await _execute_mixed(trace_id, _sub_queries, req)
 
     is_read = (route == "read")
     # eAPI と NETCONF でポートを使い分ける
@@ -795,6 +1020,72 @@ async def deploy(trace_id: str, req: DeployRequest):
         "port":      req.device.port,
         "deploy":    True,
     }
+
+    # ── mixed ルート: dry-run で生成済みの XML を NETCONF に直接投入 ────────────
+    # /execute(_execute_mixed) が生成した final_xml を使い、
+    # クエリ全体を NETCONF に再送しない（task_decomposer の再分解を避ける）。
+    if stored.get("route") == "mixed":
+        xml_to_deploy = stored.get("xml", "")
+        if not xml_to_deploy:
+            raise HTTPException(
+                status_code=400,
+                detail="混合クエリの dry-run XML が見つかりません。先に /execute を実行してください。",
+            )
+
+        # write サブクエリのクエリ文字列を復元（task_summaries から）
+        write_query = " / ".join(
+            s.get("query", "")
+            for s in stored.get("task_summaries", [])
+            if s.get("route") == "write"
+        ) or query
+
+        mixed_payload = {
+            "query":     write_query,
+            "xml":       xml_to_deploy,   # dry-run 済み XML を直接渡す
+            "device_ip": req.device.ip,
+            "username":  req.device.username,
+            "password":  req.device.password,
+            "port":      req.device.port,
+            "deploy":    True,
+        }
+        logger.info(
+            f"[{trace_id}] mixed /deploy: XML {len(xml_to_deploy)} chars → NETCONF 8001"
+        )
+        try:
+            result = await _forward(NETCONF_A2A_URL, mixed_payload)
+        except Exception as e:
+            logger.error(f"[{trace_id}] mixed deploy エラー: {e}")
+            await _push_log(trace_id, get_msg("deploy_failed") + f": {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        response = {
+            "trace_id": trace_id,
+            "route":    "mixed",
+            "status":   result.get("overall_status", result.get("status", "unknown")),
+            "summary":  result.get("summary", ""),
+            "result":   result,
+            "audit_scope_note": get_msg("audit_scope_note"),
+        }
+        _trace_store[trace_id]["deploy_result"] = response
+        _trace_store[trace_id]["deployed_at"]   = datetime.now(timezone.utc).isoformat()
+
+        await _push_log(trace_id, get_msg("deploy_done") + f": {response['status']}")
+        logger.info(f"[{trace_id}] mixed /deploy 完了: status={response['status']}")
+
+        snap_id  = req.snapshot_id.strip()
+        _ok_statuses = ("success", "all_success", "dry_run", "no_changes")
+        deploy_ok = any(s in response["status"] for s in _ok_statuses)
+        if snap_id and deploy_ok:
+            asyncio.create_task(_auto_post_check(trace_id, snap_id, req.device))
+            response["anta_post_check"] = "running"
+        else:
+            response["anta_post_check"] = "skipped"
+
+        from fastapi.responses import Response as _MR
+        return _MR(
+            content=json.dumps(response, ensure_ascii=True),
+            media_type="application/json",
+        )
 
     # ── security ルートは XDP A2A (8003) へ deploy=True で再送 ────────────────
     if stored.get("route") == "security":
