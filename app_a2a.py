@@ -13,7 +13,7 @@ A2A化前の app.py の UI レイアウトを継承し、
   POST /validate → {"xml":...}
   GET  /diff/{trace_id}
 
-CNV（Continuous Network Verification）自動 Post-Check:
+自動 Post-Check（deploy 後の ANTA 自動実行）:
   Before Snapshot 取得済みの場合、/deploy 完了直後に Hub が
   ANTA post_check を asyncio.create_task でバックグラウンド実行する。
   結果は _push_log（WebSocket）でリアルタイム通知 → UI チャットに表示。
@@ -125,7 +125,7 @@ _UI_MSG = {
         "cnv_done_ng":         "⚠️ 自動 Post-Check: 副作用を検出",
         "cnv_skipped":         "（Before Snapshot 未取得 — Post-Check スキップ）",
         "cnv_error":           "⚠️ 自動 Post-Check 失敗",
-        "cnv_label":           "CNV 自動検証",
+        "cnv_label":           "自動 Post-Check",
         "cnv_new_issues":      "新規 failure（変更の副作用）",
     },
     "en": {
@@ -199,7 +199,7 @@ _UI_MSG = {
         "cnv_done_ng":         "⚠️ Auto Post-Check: Side-effects detected",
         "cnv_skipped":         "(Before Snapshot not taken — Post-Check skipped)",
         "cnv_error":           "⚠️ Auto Post-Check failed",
-        "cnv_label":           "CNV Auto Verify",
+        "cnv_label":           "Auto Post-Check",
         "cnv_new_issues":      "New failures (side-effects of change)",
     },
 }
