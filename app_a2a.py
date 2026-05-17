@@ -503,18 +503,25 @@ def _classify_threat(flow: dict, drop_list: dict, qos_list: dict):
     pkts  = stats.get("packets", 0)
     drops = stats.get("dropped_packets", 0)
     block_key = f"{ip}:{port} [{proto}]"
+
+    # ── SYNスパイク判定は Go (main.go) に完全委譲 ──────────────────────────────
+    # Go側が QOS_MAP に書き込んだ事実だけを信頼する。
+    # GUI側で syn 累積値を閾値判定しない（低速攻撃の表示漏れを防ぐ）。
+    if ip in qos_list:
+        return {"kind": "SYNスパイク",
+                "detail": f"syn={syn:,} ack=0 → SYN Flood検知 (Go自動ミティゲーション済)",
+                "action": "Mitigated", "ip": ip, "port": port, "proto": proto}
+
     if block_key in drop_list or drops > 0:
         return None
-    if proto == "tcp" and syn > 1000 and ack == 0:
-        action = "Mitigated" if ip in qos_list else "XDP_DROP"
-        return {"kind": "SYNスパイク",
-                "detail": f"syn={syn:,} ack=0 → SYN Flood検知",
-                "action": action, "ip": ip, "port": port, "proto": proto}
+
+    # ── ポートスキャン検知は GUI側で判定（Go に対応 API なし） ─────────────────
     if proto == "tcp" and syn > 0 and (ack / (syn + 1)) < 0.5:
         return {"kind": "ポートスキャン疑い",
                 "detail": f"ack/syn={ack/(syn+1):.2f} ハーフオープン",
                 "action": "XDP_DROP", "ip": ip, "port": port, "proto": proto}
-    # icmp / udp は ack/syn=0 が正常。drop/block は提案せず脅威ログのみ記録
+
+    # ── icmp / udp 異常フロー（drop/block 提案なし・脅威ログのみ） ───────────────
     if proto in ("icmp", "udp") and pkts > SecurityState.PPS_FLOOD_THR:
         return {"kind": "異常フロー",
                 "detail": f"port={port} {proto.upper()} flood packets={pkts:,}",
