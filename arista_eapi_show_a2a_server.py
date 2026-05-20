@@ -170,12 +170,17 @@ EAPI_READ_TEMPLATE = """
 - BGP ネイバー詳細確認: "show ip bgp neighbors" を使用すること
 - "show bgp summary" は使用禁止（EOS ネイティブ形式は JSON キーが異なるため）
 - 理由: 社内は Cisco 機器ベースのため Cisco 互換形式（show ip bgp 系）に統一する
+- BGP アクセスリスト確認: "show bgp access-list" を使用すること
+  ※ "show ip bgp access-list" は Arista EOS で "% Incomplete command" になるため使用禁止
 
 【インターフェース・トラフィックコマンドの制約】
 - インターフェース状態確認（up/down, description）: "show interfaces" を使用すること
 - トラフィック・カウンター確認（送受信パケット数, バイト数）: "show interfaces counters" を使用すること
 - インターフェース一覧・IP アドレス確認: "show ip interface brief" を使用すること
 - 「トラフィック」「カウンター」「パケット数」「送受信」というキーワードは "show interfaces counters" を優先すること
+- 特定インターフェースの description 確認: "show interfaces Ethernet1" を使用すること
+  ※ "show interfaces description Ethernet1" は Arista EOS で無効（Invalid input）のため使用禁止
+  ※ "show interfaces description" は全インターフェース一覧のみ有効（引数なし）
 
 ```json
 {{
@@ -572,8 +577,8 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
             "interfaceAddress" in info
             for info in res["interfaces"].values()
         ):
-            lines.append(f"{'Interface':<16} {'IP Address':<20} {'Status':<12} {'Proto':<8} {'MTU'}")
-            lines.append("-" * 72)
+            lines.append(f"{'Interface':<16} {'IP Address':<20} {'Status':<12} {'Proto':<8} {'MTU':<6} Description")
+            lines.append("-" * 90)
             for intf, info in res["interfaces"].items():
                 addr_raw = info.get("interfaceAddress", {})
                 ip_str = "—"
@@ -591,13 +596,15 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
                     mask_len = primary.get("maskLen", "")
                     if address and address != "0.0.0.0":
                         ip_str = f"{address}/{mask_len}"
-                mtu = info.get("mtu", "?")
+                mtu  = info.get("mtu", "?")
+                desc = info.get("description", "") or "—"  # ★ description 追加
                 lines.append(
                     f"  {intf:<14} "
                     f"{ip_str:<18} "
                     f"{info.get('interfaceStatus', '?'):<12} "
                     f"{info.get('lineProtocolStatus', '?'):<8} "
-                    f"{mtu}"
+                    f"{str(mtu):<6} "
+                    f"{desc}"
                 )
 
         # ── show interfaces description ───────────────────────────────────
@@ -630,35 +637,63 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
                 status = vinfo.get("status", "?")
                 lines.append(f"  {vid:<4} {name:<20} {status}")
 
-        # ── show lldp neighbors detail ────────────────────────────────────
-        # JSON 構造（実機確認済み）:
+        # ── show lldp neighbors / show lldp neighbors detail ───────────────
+        # Arista EOS は コマンドによって lldpNeighbors の型が異なる:
+        #
+        # show lldp neighbors → list 形式（実機確認: 2026-05-20）
+        #   lldpNeighbors: [
+        #     { "port": "Ethernet1", "neighborDevice": "sw02",
+        #       "neighborPort": "Ethernet2", "ttl": 120 }
+        #   ]
+        #
+        # show lldp neighbors detail → dict 形式
         #   lldpNeighbors: {
-        #     "Management0": { "lldpNeighborInfo": [ {chassisId, systemName, ...} ] },
-        #     "Ethernet1":   { "lldpNeighborInfo": [] },  ← neighbor なし
+        #     "Ethernet1": { "lldpNeighborInfo": [{chassisId, systemName, ...}] }
         #   }
+        #
+        # ★ 両形式に対応する（isinstance で分岐）
         elif "lldpNeighbors" in res:
+            lldp_data = res["lldpNeighbors"]
             lines.append(f"{'ローカルIF':<16} {'ネイバー名':<20} {'ネイバーIF':<18} {'説明'}")
             lines.append("-" * 72)
             found = False
-            for local_if, if_data in res["lldpNeighbors"].items():
-                neighbor_list = if_data.get("lldpNeighborInfo", [])
-                for nb in neighbor_list:
+
+            if isinstance(lldp_data, list):
+                # ── list 形式: show lldp neighbors ───────────────────────────
+                for nb in lldp_data:
+                    local_if    = nb.get("port", "?")
+                    system_name = nb.get("neighborDevice", "?")
+                    nb_if       = nb.get("neighborPort", "?")
+                    ttl         = nb.get("ttl", "")
+                    desc        = f"ttl={ttl}" if ttl else ""
                     found = True
-                    system_name = nb.get("systemName", "?")
-                    nb_if_info  = nb.get("neighborInterfaceInfo", {})
-                    nb_if       = nb_if_info.get("interfaceId_v2") or nb_if_info.get("interfaceId", "?")
-                    # interfaceId が '"mgmt0"' のようにクォートを含む場合を除去
-                    nb_if = nb_if.strip('"')
-                    chassis_id  = nb.get("chassisId", "")
-                    sys_desc    = nb.get("systemDescription", "")
-                    # 説明は systemDescription の先頭部分のみ（長いので省略）
-                    desc = sys_desc.split(" ")[0] if sys_desc else chassis_id
                     lines.append(
                         f"  {local_if:<14} "
                         f"{system_name:<18} "
                         f"{nb_if:<16} "
                         f"{desc}"
                     )
+
+            elif isinstance(lldp_data, dict):
+                # ── dict 形式: show lldp neighbors detail ────────────────────
+                for local_if, if_data in lldp_data.items():
+                    neighbor_list = if_data.get("lldpNeighborInfo", [])
+                    for nb in neighbor_list:
+                        found = True
+                        system_name = nb.get("systemName", "?")
+                        nb_if_info  = nb.get("neighborInterfaceInfo", {})
+                        nb_if       = nb_if_info.get("interfaceId_v2") or nb_if_info.get("interfaceId", "?")
+                        nb_if = nb_if.strip('"')
+                        chassis_id  = nb.get("chassisId", "")
+                        sys_desc    = nb.get("systemDescription", "")
+                        desc = sys_desc.split(" ")[0] if sys_desc else chassis_id
+                        lines.append(
+                            f"  {local_if:<14} "
+                            f"{system_name:<18} "
+                            f"{nb_if:<16} "
+                            f"{desc}"
+                        )
+
             if not found:
                 lines.append("  (LLDP ネイバーなし)")
 
@@ -1011,6 +1046,11 @@ async def _llm_format_text(cmds: List[str], text_result: List[str], llm: ChatOpe
     """
     text フォーマットで取得した CLI 出力を LLM で整形する。
     JSON より大幅にサイズが小さいため 8000 字制限を超えにくい。
+
+    【2026-05-20 修正】空出力・エラー出力の早期リターン
+      空出力（output=""）のとき LLM に渡すと「未設定の可能性があります」等の
+      ハルシネーション（架空の出力例を含む補完）が発生する。
+      → raw_text が空またはエラー行のみの場合は LLM を呼ばず即返却する。
     """
     try:
         # text フォーマットは output キーにテキストが入る
@@ -1021,9 +1061,27 @@ async def _llm_format_text(cmds: List[str], text_result: List[str], llm: ChatOpe
         if len(raw_text) > 12000:
             raw_text = raw_text[:12000] + "\n... (省略)"
 
+        # ── 早期リターン: 空出力 ──────────────────────────────────────────────
+        # cEOS が「設定なし」で何も出力しない場合（例: show bgp access-list で ACL 未設定）
+        # LLM に空文字列を渡すとハルシネーションが発生するため、即座に返す。
+        if not raw_text.strip():
+            cmd_str = ", ".join(str(c) for c in cmds)
+            logger.info(f"[eAPI] 空出力: {cmd_str} → LLM スキップ")
+            return f"（出力なし — {cmd_str} の実行結果は空です。該当の設定がされていない可能性があります）"
+
+        # ── 早期リターン: % エラー出力 ────────────────────────────────────────
+        # 「% Incomplete command」「% Invalid input」等の EOS エラー行のみの場合も
+        # LLM を呼ばずそのまま返す（LLM が補完するとミスリードになる）。
+        lines = [l.strip() for l in raw_text.strip().splitlines() if l.strip()]
+        if lines and all(l.startswith("%") for l in lines):
+            cmd_str = ", ".join(str(c) for c in cmds)
+            logger.warning(f"[eAPI] コマンドエラー: {cmd_str} → {raw_text.strip()[:80]}")
+            return f"コマンドエラー: {raw_text.strip()}"
+
         prompt = f"""以下は Arista cEOS で実行した CLI コマンドの出力です。
 人間が読みやすい形式に整形して表示してください。
 重要な情報（状態、アドレス、統計値等）を漏らさず表示してください。
+【重要】出力に存在しない情報を推測・補完・例示しないこと。
 
 実行コマンド: {cmds}
 
@@ -1198,6 +1256,22 @@ class AristaEapiShowExecutor(AgentExecutor):
                            "show system environment"):
                     logger.info(f"コマンド正規化: '{cmd}' → 'show system environment temperature'")
                     normalized_cmds.append("show system environment temperature")
+
+                # show interfaces description <IF名> → show interfaces <IF名>
+                # Arista EOS では "show interfaces description Ethernet1" が
+                # "Invalid input (at token 3: 'Ethernet1')" になるため正規化する。
+                # 特定IFの詳細は "show interfaces <IF名>" で取得する。
+                elif c.startswith("show interfaces description "):
+                    import re as _re
+                    # IF名を抽出（description の後の部分）
+                    _if_name = cmd.strip()[len("show interfaces description "):].strip()
+                    if _if_name:
+                        _normalized = f"show interfaces {_if_name}"
+                        logger.info(f"コマンド正規化: '{cmd}' → '{_normalized}'")
+                        normalized_cmds.append(_normalized)
+                    else:
+                        # 引数なし（全IF一覧）はそのまま
+                        normalized_cmds.append(cmd)
 
                 else:
                     normalized_cmds.append(cmd)

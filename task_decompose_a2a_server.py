@@ -104,7 +104,14 @@ _ws_clients:  Dict[str, list] = {}
 
 READ_KEYWORDS = [
     "確認","表示","一覧","状態","参照","見せ","教え","show","get",
-    "list","check","status","display","バージョン","version","情報",
+    "list","check","status","display","バージョン","version",
+    "見たい","知りたい","調べたい","確かめたい",  # ★ 追加(2026-05-20): 参照意図の口語表現
+    "acl",   # ★ 追加(2026-05-20): show ip access-lists は eAPI 参照コマンド
+    # ★ 削除(2026-05-20 解決策B): "情報" を除去
+    #   理由: 「セキュリティの統計情報」「XDP情報」等、あらゆる文脈で使われるため
+    #         単語単体では read/security を決定できない → LLM fallback に委ねる
+    #   影響: 「バージョン情報を確認して」等は「確認」「バージョン」が残るため影響なし
+    #         「セキュリティの統計情報を調べて」はLLM fallbackに到達→正しくsecurityへ
 ]
 WRITE_KEYWORDS = [
     "設定","変更","追加","削除","適用","投入","作成","修正",
@@ -127,17 +134,40 @@ WRITE_KEYWORDS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 # XDP/FW に明示的に言及しているキーワード（これだけで security 確定）
+# ★ 2026-05-20 修正: READ_OVERRIDE 方式導入（方針B）
+#   「BGPのACLを確認して」→ acl が SECURITY_REQUIRED にヒットして security 誤判定
+#   していた問題を修正。acl/security/qos 等は参照目的でも使われる語なので除去し、
+#   READ_OVERRIDE_WORDS + READ動詞の AND 条件で read に倒す仕組みを追加。
+#   XDP固有の操作系ワード（ブロック・遮断・xdp・ebpf等）のみここに残す。
 SECURITY_REQUIRED = [
-    # 日本語: XDP/FW操作を示す明示的な単語
-    "ブロック", "遮断", "セキュリティ", "ファイアウォール",
-    "xdp", "ebpf", "firewall", "acl",
+    # 日本語: XDP/FW操作を示す明示的な操作系単語
+    "ブロック", "遮断",
+    # XDP/eBPF 固有（Arista デバイス設定とは別ドメイン）
+    "xdp", "ebpf", "firewall",
     # ブロック操作の英語表現（drop単体は除外 → "drop list" "drop/block" のみ）
     "block", "drop list", "drop/block", "drop/unblock",
     "ブロックリスト",
-    # QoS帯域制限（XDP専用機能）
-    "qos", "帯域制限", "rate limit", "rate-limit",
-    # security という単語（英語クエリ対応）
-    "security",
+    # QoS帯域制限（操作系のみ残す）
+    # ★ "qos" 単体は除去 → "QoSの設定を確認" が eAPI に正しく流れるように
+    "帯域制限", "rate limit", "rate-limit",
+    # ★ 除去済みキーワード（READ_OVERRIDE_WORDS に移動）:
+    #   "acl"        → show ip access-lists は eAPI 参照
+    #   "security"   → セキュリティポリシー確認は eAPI 参照
+    #   "セキュリティ" → 同上
+    #   "qos"        → QoS設定確認は eAPI 参照
+    #   "ファイアウォール" → FWルール表示は eAPI 参照の場合がある
+]
+
+# READ優先上書きワード:
+#   SECURITY_REQUIRED にヒットしても、このワード + READ動詞がある場合は read に倒す。
+#   「BGPのACLを確認して」「QoSの設定を見せて」「セキュリティポリシーを表示」等が対象。
+#   XDP固有ワード（xdp/block/遮断）は SECURITY_REQUIRED に残してあるので上書きしない。
+READ_OVERRIDE_WORDS = [
+    "acl",           # show ip access-lists → eAPI 参照
+    "security",      # セキュリティポリシーを確認 → eAPI 参照
+    "セキュリティ",  # 同上（日本語）
+    "qos",           # QoSの設定を確認 → eAPI 参照
+    "ファイアウォール",  # ファイアウォールのルールを表示 → eAPI 参照
 ]
 
 # 脅威・攻撃系キーワード（SECURITY_REQUIRED との AND 条件で security 判定）
@@ -174,11 +204,29 @@ def classify_query(query: str) -> str:
         return "verify"
 
     # 2. XDP/FW 明示キーワードがあれば security 確定
+    #    ★ ただし READ_OVERRIDE_WORDS + READ動詞がある場合は read を優先（方針B）
+    #    例: "BGPのACLを確認して" → acl がヒットするが "確認" もある → read
+    #    例: "10.0.1.30をブロックして" → ブロックがヒット、READ_OVERRIDE にない → security
     if any(k in q for k in SECURITY_REQUIRED):
+        override = any(k in q for k in READ_OVERRIDE_WORDS)
+        has_read_verb = any(k in q for k in READ_KEYWORDS)
+        if override and has_read_verb:
+            return "read"
         return "security"
 
-    # 3. READ キーワードがある場合は、脅威系キーワードがあっても read を優先
-    #    （"フローの状態を確認" / "パケット統計を見せて" → read）
+    # 3. セキュリティ系曖昧語 × XDP文脈語 の AND → security（step3より前に判定）
+    #    ★ 解決策B (2026-05-20): 「セキュリティの統計を見せて」等を正しく security へ
+    #    「セキュリティ」単体は曖昧（デバイス設定参照でも使われる）だが、
+    #    「統計/アラート/異常/監視/フロー」と組み合わさると XDP 文脈と判断できる。
+    #    これを READ_KEYWORDS チェックより先に評価することで、
+    #    「見せ」「確認」等の READ 動詞があっても security に正しく流れる。
+    _sec_ambiguous   = ["セキュリティ", "security"]
+    _sec_ctx_combine = ["統計", "stats", "アラート", "alert", "異常", "監視", "monitor",
+                        "脅威", "フロー", "flow", "攻撃", "attack"]
+    if (any(k in q for k in _sec_ambiguous)
+            and any(k in q for k in _sec_ctx_combine)):
+        return "security"
+
     has_read  = any(k in q for k in READ_KEYWORDS)
     has_write = any(k in q for k in WRITE_KEYWORDS)
 
@@ -191,19 +239,36 @@ def classify_query(query: str) -> str:
         return "security"
 
     # 5. LLM フォールバック（改善プロンプト）
+    # ★ 解決策B (2026-05-20): 改善プロンプト
+    #   旧プロンプトの問題: security の定義が「操作系のみ」だったため
+    #   「セキュリティの統計情報を調べて」等の「参照系 XDP クエリ」を
+    #   LLM が read と誤判定していた。
+    #   改善: security に「XDP に関するあらゆる参照・分析・統計」も含むと明示。
+    #   また「セキュリティ＋統計/監視/アラート → security」の判定例を追加。
     result = invoke_with_fallback(
         llm,
-        "あなたはネットワーク操作の分類器です。\n"
-        "以下の質問を read / write / security / verify のいずれか一単語で分類してください。\n\n"
-        "【分類基準】\n"
-        "  read     = デバイスの状態参照・確認（NTP/BGP/インターフェース/ルーティング等）\n"
-        "  write    = デバイスへの設定変更・追加・削除\n"
-        "  security = XDP/eBPF Firewall操作・ブロック・遮断・QoS帯域制限\n"
-        "  verify   = ANTA/スナップショット/事後検証\n\n"
-        "【重要】NTP・BGP・OSPF・インターフェース・ルート等のデバイス参照は必ず read。\n"
-        "security に分類するのは XDP/ファイアウォール/ブロック/遮断 の操作のみ。\n\n"
-        f"質問: {query}\n"
-        "回答（一単語のみ）:"
+        "あなたは Arista ネットワーク管理システムのルーター AI です。\n"
+        "以下のクエリを 4 種類のルートのうち 1 つに分類し、一単語のみで回答してください。\n\n"
+        "【ルート定義】\n"
+        "  read     : Arista cEOS デバイスの状態参照（show コマンド相当）\n"
+        "             例: BGP 状態確認 / インターフェース確認 / ACL 表示 /\n"
+        "                 ルーティングテーブル / NTP 状態 / VLAN 一覧\n"
+        "  write    : Arista cEOS デバイスへの設定変更\n"
+        "             例: VLAN 作成 / インターフェース設定 / BGP neighbor 追加\n"
+        "  security : XDP/eBPF ファイアウォールに関するあらゆる操作・参照・分析\n"
+        "             例: IP ブロック / 遮断 / QoS 帯域制限 / フロー統計参照 /\n"
+        "                 セキュリティ統計情報 / セキュリティアラート /\n"
+        "                 セキュリティ脅威分析 / XDP 監視 / 攻撃検知\n"
+        "  verify   : ANTA によるネットワーク検証・スナップショット\n"
+        "             例: 事後検証 / post-check / anta テスト / 副作用確認\n\n"
+        "【判定ルール（重要）】\n"
+        "  - 「セキュリティ」+「統計/監視/アラート/分析/フロー」→ security\n"
+        "  - 「セキュリティポリシー」「ACL」「FW ルール」等デバイス設定の参照 → read\n"
+        "  - 「ブロック」「遮断」「xdp」「ebpf」単独 → security\n"
+        "  - 「show」で始まる CLI コマンド → read\n"
+        "  - NTP / BGP / OSPF / インターフェース / ルート の参照 → read\n\n"
+        f"クエリ: {query}\n"
+        "回答（read / write / security / verify のいずれか一単語のみ）:"
     ).strip().lower()
 
     if "write"    in result: return "write"
