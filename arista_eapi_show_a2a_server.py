@@ -165,9 +165,17 @@ EAPI_READ_TEMPLATE = """
 - 回答は必ず以下の JSON のみ。```json ブロックで囲むこと。説明文は不要。
 
 【BGP コマンドの制約】
-- BGP の状態確認には必ず "show ip bgp summary" を使用すること
+- BGP ネイバー状態・サマリー確認: "show ip bgp summary" を使用すること
+- BGP ルーティングテーブル確認: "show ip bgp" をそのまま使用すること（summary を付けない）
+- BGP ネイバー詳細確認: "show ip bgp neighbors" を使用すること
 - "show bgp summary" は使用禁止（EOS ネイティブ形式は JSON キーが異なるため）
-- 理由: 社内は Cisco 機器ベースのため Cisco 互換形式（show ip bgp summary）に統一する
+- 理由: 社内は Cisco 機器ベースのため Cisco 互換形式（show ip bgp 系）に統一する
+
+【インターフェース・トラフィックコマンドの制約】
+- インターフェース状態確認（up/down, description）: "show interfaces" を使用すること
+- トラフィック・カウンター確認（送受信パケット数, バイト数）: "show interfaces counters" を使用すること
+- インターフェース一覧・IP アドレス確認: "show ip interface brief" を使用すること
+- 「トラフィック」「カウンター」「パケット数」「送受信」というキーワードは "show interfaces counters" を優先すること
 
 ```json
 {{
@@ -392,6 +400,43 @@ def _cmds_from_xml(xml_str: str) -> list[str]:
     return cmds
 
 
+async def _llm_summarize_diff(diff_text: str, xml_str: str, llm) -> str:
+    """
+    EOS が計算した +/- diff、または生成 XML を LLM に渡して
+    「何が追加・削除されるか」を承認前チェック用に1〜2文で要約する。
+
+    - diff あり（VLAN/Interface等）: EOS の diff から追加・削除を報告
+    - diff なし（BGP等, session diff スキップ）: XML から変更内容を読み取る
+    """
+    try:
+        if diff_text and diff_text.strip():
+            prompt = f"""以下は Arista EOS の設定変更差分（+/- 形式）です。
+承認前の確認用として、「何が追加され、何が削除されるか」を1〜2文の日本語で簡潔に報告してください。
+「〜が追加されます」「〜が削除されます」という形式で、具体的な値（VLAN ID、名前、IPアドレス等）を含めてください。
+
+差分:
+{diff_text}
+"""
+        else:
+            # BGP 等 session diff スキップの場合は XML から要約
+            xml_excerpt = xml_str[:2000] if xml_str else ""
+            if not xml_excerpt:
+                return ""
+            prompt = f"""以下は Arista EOS への NETCONF 設定変更 XML です。
+承認前の確認用として、「何が追加・変更・削除されるか」を1〜2文の日本語で簡潔に報告してください。
+「〜が追加されます」「〜が削除されます」という形式で、具体的な値（IPアドレス、AS番号等）を含めてください。
+
+XML:
+{xml_excerpt}
+"""
+        response = llm.invoke(prompt)
+        summary = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        return summary
+    except Exception as e:
+        logger.warning(f"_llm_summarize_diff 失敗: {e}")
+        return ""
+
+
 def session_diff(
     xml_str:   str,
     host:      str,
@@ -518,24 +563,41 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
     """
     lines = []
     for res in result_list:
-        # ── show interfaces ──────────────────────────────────────────────
-        # show interfaces counters も "interfaces" キーを持つが、
-        # interfaceStatus / lineProtocolStatus を持たないため厳密に区別する。
-        # 先頭インターフェースに interfaceStatus があれば show interfaces と判定。
+        # ── show ip interface brief / show interfaces ─────────────────────
+        # 両コマンドとも interfaces キー + interfaceAddress を持つ。
+        # show ip interface brief: interfaceAddress = dict  → ipAddr.address
+        # show interfaces:         interfaceAddress = list  → [0].primaryIp.address
+        # interfaceAddress の型で判別してIP を取得する。
         if "interfaces" in res and any(
-            "interfaceStatus" in info
+            "interfaceAddress" in info
             for info in res["interfaces"].values()
         ):
-            # ヘッダー幅: Description は切り捨てなし（[:18] を撤廃）
-            lines.append(f"{'Interface':<16} {'Status':<12} {'Proto':<8} Description")
-            lines.append("-" * 70)
+            lines.append(f"{'Interface':<16} {'IP Address':<20} {'Status':<12} {'Proto':<8} {'MTU'}")
+            lines.append("-" * 72)
             for intf, info in res["interfaces"].items():
-                desc = info.get('description', '')   # ← 切り捨てなし
+                addr_raw = info.get("interfaceAddress", {})
+                ip_str = "—"
+                if isinstance(addr_raw, dict):
+                    # show ip interface brief 形式: {ipAddr: {address, maskLen}}
+                    ip_addr  = addr_raw.get("ipAddr", {})
+                    address  = ip_addr.get("address", "")
+                    mask_len = ip_addr.get("maskLen", "")
+                    if address:
+                        ip_str = f"{address}/{mask_len}"
+                elif isinstance(addr_raw, list) and addr_raw:
+                    # show interfaces 形式: [{primaryIp: {address, maskLen}}]
+                    primary = addr_raw[0].get("primaryIp", {})
+                    address  = primary.get("address", "")
+                    mask_len = primary.get("maskLen", "")
+                    if address and address != "0.0.0.0":
+                        ip_str = f"{address}/{mask_len}"
+                mtu = info.get("mtu", "?")
                 lines.append(
                     f"  {intf:<14} "
+                    f"{ip_str:<18} "
                     f"{info.get('interfaceStatus', '?'):<12} "
                     f"{info.get('lineProtocolStatus', '?'):<8} "
-                    f"{desc}"
+                    f"{mtu}"
                 )
 
         # ── show interfaces description ───────────────────────────────────
@@ -568,16 +630,37 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
                 status = vinfo.get("status", "?")
                 lines.append(f"  {vid:<4} {name:<20} {status}")
 
-        # ── show lldp neighbors ───────────────────────────────────────────
+        # ── show lldp neighbors detail ────────────────────────────────────
+        # JSON 構造（実機確認済み）:
+        #   lldpNeighbors: {
+        #     "Management0": { "lldpNeighborInfo": [ {chassisId, systemName, ...} ] },
+        #     "Ethernet1":   { "lldpNeighborInfo": [] },  ← neighbor なし
+        #   }
         elif "lldpNeighbors" in res:
-            lines.append(f"{'ローカルIF':<18} {'ネイバーデバイス':<26} {'ネイバーIF':<20}")
-            lines.append("-" * 62)
-            for nb in res["lldpNeighbors"]:
-                lines.append(
-                    f"  {nb.get('port',''):<16} "
-                    f"{nb.get('neighborDevice',''):<24} "
-                    f"{nb.get('neighborPort','')}"
-                )
+            lines.append(f"{'ローカルIF':<16} {'ネイバー名':<20} {'ネイバーIF':<18} {'説明'}")
+            lines.append("-" * 72)
+            found = False
+            for local_if, if_data in res["lldpNeighbors"].items():
+                neighbor_list = if_data.get("lldpNeighborInfo", [])
+                for nb in neighbor_list:
+                    found = True
+                    system_name = nb.get("systemName", "?")
+                    nb_if_info  = nb.get("neighborInterfaceInfo", {})
+                    nb_if       = nb_if_info.get("interfaceId_v2") or nb_if_info.get("interfaceId", "?")
+                    # interfaceId が '"mgmt0"' のようにクォートを含む場合を除去
+                    nb_if = nb_if.strip('"')
+                    chassis_id  = nb.get("chassisId", "")
+                    sys_desc    = nb.get("systemDescription", "")
+                    # 説明は systemDescription の先頭部分のみ（長いので省略）
+                    desc = sys_desc.split(" ")[0] if sys_desc else chassis_id
+                    lines.append(
+                        f"  {local_if:<14} "
+                        f"{system_name:<18} "
+                        f"{nb_if:<16} "
+                        f"{desc}"
+                    )
+            if not found:
+                lines.append("  (LLDP ネイバーなし)")
 
         # ── show ip bgp summary (Cisco 互換形式・統一コマンド) ──────────────
         # JSON 構造（実機 show ip bgp summary 確認済み）:
@@ -593,8 +676,10 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
         # 注意: show bgp summary（EOS ネイティブ）は BGP コマンド正規化で
         #       show ip bgp summary に自動変換済みのためここには来ない。
         #       ただし念のため peers に peerAsn がある場合も同じ表示形式で処理する。
+        # ※ show ip bgp（ルーティングテーブル）も vrfs+routerId を持つが
+        #   peers キーを持たないため、peers の存在を必須条件にして区別する。
         elif "vrfs" in res and any(
-            "peers" in vrf or "routerId" in vrf
+            "peers" in vrf
             for vrf in res["vrfs"].values()
         ):
             def _bgp_val(d: dict, *keys: str, default: str = "?") -> str:
@@ -714,7 +799,11 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
                     )
 
         # ── show ip route ─────────────────────────────────────────────────
-        elif "vrfs" in res:
+        # vrfs > {vrf名} > routes: {...} の構造を持つ場合のみ処理
+        # peerList を持つ BGP neighbors と区別するため routes キーを必須とする
+        elif "vrfs" in res and any(
+            "routes" in vrf for vrf in res["vrfs"].values()
+        ):
             for vrf_name, vrf in res["vrfs"].items():
                 lines.append(f"VRF: {vrf_name}")
                 for prefix, route_info in vrf.get("routes", {}).items():
@@ -791,6 +880,65 @@ def _format_interfaces(result_list: List[Dict]) -> Optional[str]:
                     f"{str(refid):<10} {str(poll):>5}s  {reach_str}"
                 )
 
+        # ── show bgp neighbors / show ip bgp neighbors ───────────────────
+        # EOS の show ip bgp neighbors の JSON 構造（実機確認済み）:
+        #   vrfs > {vrf名} > peerList: [
+        #     { peerAddress, asn, state, establishedTime, localAsn,
+        #       sentMessages, receivedMessages, prefixesSent, prefixesReceived,
+        #       routerId, localRouterId, ... }
+        #   ]
+        # ※ bgpState/description キーは存在しない（state / localAsn を使用）
+        elif "vrfs" in res and any(
+            "peerList" in vrf
+            for vrf in res["vrfs"].values()
+        ):
+            for vrf_name, vrf in res["vrfs"].items():
+                peer_list = vrf.get("peerList", [])
+                if not peer_list:
+                    continue
+                lines.append(f"BGP Neighbors (VRF: {vrf_name})")
+                lines.append("=" * 72)
+                for peer in peer_list:
+                    addr      = peer.get("peerAddress", "?")
+                    state     = peer.get("state", "?")
+                    asn       = peer.get("asn", "?")
+                    router_id = peer.get("routerId", "?")
+                    local_asn = peer.get("localAsn", "?")
+                    local_rid = peer.get("localRouterId", "?")
+                    # 経過時間（establishedTime は秒数）
+                    est_sec   = peer.get("establishedTime", 0)
+                    try:
+                        total_s = int(est_sec)
+                        days    = total_s // 86400
+                        h = (total_s % 86400) // 3600
+                        m = (total_s % 3600) // 60
+                        s = total_s % 60
+                        updown = (f"{days}d {h:02d}:{m:02d}:{s:02d}"
+                                  if days > 0 else f"{h:02d}:{m:02d}:{s:02d}")
+                    except (ValueError, TypeError):
+                        updown = str(est_sec)
+                    # メッセージ統計
+                    msg_rcvd   = peer.get("receivedMessages", "?")
+                    msg_sent   = peer.get("sentMessages", "?")
+                    pfx_rcvd   = peer.get("prefixesReceived", "?")
+                    pfx_sent   = peer.get("prefixesSent", "?")
+                    # link type
+                    link_type = peer.get("linkType", "")
+
+                    lines.append(f"  Neighbor       : {addr}")
+                    lines.append(f"  Remote AS      : {asn}  ({link_type})")
+                    lines.append(f"  State          : {state}")
+                    lines.append(f"  Up/Down        : {updown}")
+                    lines.append(f"  Remote Router-ID: {router_id}")
+                    lines.append(f"  Local AS       : {local_asn}  Local Router-ID: {local_rid}")
+                    lines.append(f"  Msg Rcvd/Sent  : {msg_rcvd} / {msg_sent}")
+                    lines.append(f"  Prefix Rcvd/Sent: {pfx_rcvd} / {pfx_sent}")
+                    # Hold/Keepalive
+                    hold    = peer.get("holdTime", "?")
+                    keepalive = peer.get("keepaliveTime", "?")
+                    lines.append(f"  Hold/Keepalive : {hold}s / {keepalive}s")
+                    lines.append("")
+
         # ── その他: structured パース未対応 → None を返して LLM パースへ委譲 ──
         else:
             return None
@@ -840,11 +988,9 @@ eAPI 実行結果 (JSON):
 async def _llm_format_raw(cmds: List[str], raw_result: List[Dict], llm: ChatOpenAI) -> str:
     """
     structured パース未対応のコマンド結果を LLM で整形する。
-    task_decompose_a2a_server の LLM インスタンスを直接呼ぶのではなく、
-    同じ LLM（GROQ）を使ってローカルで整形する（A2A 通信不要）。
+    JSON が大きすぎる場合は先頭部分のみ渡す（8000字制限）。
     """
     try:
-        # raw_result が大きすぎる場合は先頭部分のみ渡す
         raw_json = json.dumps(raw_result, ensure_ascii=False, indent=2)
         if len(raw_json) > 8000:
             raw_json = raw_json[:8000] + "\n... (省略)"
@@ -858,8 +1004,41 @@ async def _llm_format_raw(cmds: List[str], raw_result: List[Dict], llm: ChatOpen
         return text if text else json.dumps(raw_result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"LLM パース失敗: {e}")
-        # フォールバック: raw JSON をそのまま返す
         return json.dumps(raw_result, ensure_ascii=False, indent=2)
+
+
+async def _llm_format_text(cmds: List[str], text_result: List[str], llm: ChatOpenAI) -> str:
+    """
+    text フォーマットで取得した CLI 出力を LLM で整形する。
+    JSON より大幅にサイズが小さいため 8000 字制限を超えにくい。
+    """
+    try:
+        # text フォーマットは output キーにテキストが入る
+        raw_text = "\n---\n".join(
+            r.get("output", "") if isinstance(r, dict) else str(r)
+            for r in text_result
+        )
+        if len(raw_text) > 12000:
+            raw_text = raw_text[:12000] + "\n... (省略)"
+
+        prompt = f"""以下は Arista cEOS で実行した CLI コマンドの出力です。
+人間が読みやすい形式に整形して表示してください。
+重要な情報（状態、アドレス、統計値等）を漏らさず表示してください。
+
+実行コマンド: {cmds}
+
+CLI 出力:
+{raw_text}
+"""
+        response = llm.invoke(prompt)
+        text = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        return text if text else raw_text
+    except Exception as e:
+        logger.warning(f"LLM text パース失敗: {e}")
+        return "\n".join(
+            r.get("output", "") if isinstance(r, dict) else str(r)
+            for r in text_result
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -975,6 +1154,25 @@ class AristaEapiShowExecutor(AgentExecutor):
                     logger.info("コマンド正規化: 'show bgp summary' → 'show ip bgp summary'")
                     normalized_cmds.append("show ip bgp summary")
 
+                # show bgp neighbors → show ip bgp neighbors
+                elif c == "show bgp neighbors" or c == "show bgp neighbor":
+                    logger.info(f"コマンド正規化: '{cmd}' → 'show ip bgp neighbors'")
+                    normalized_cmds.append("show ip bgp neighbors")
+
+                # show bgp neighbors <IP> [detail] → show ip bgp neighbors <IP>
+                elif (c.startswith("show bgp neighbors ") or
+                      c.startswith("show bgp neighbor ") or
+                      c.startswith("show ip bgp neighbors ") or
+                      c.startswith("show ip bgp neighbor ")):
+                    # detail キーワードを除去
+                    import re as _re
+                    normalized = _re.sub(r'\s+detail$', '', cmd.strip(), flags=_re.IGNORECASE)
+                    # show bgp → show ip bgp に統一
+                    normalized = _re.sub(r'^show bgp', 'show ip bgp', normalized, flags=_re.IGNORECASE)
+                    if normalized != cmd:
+                        logger.info(f"コマンド正規化: '{cmd}' → '{normalized}'")
+                    normalized_cmds.append(normalized)
+
                 # NTP 正規化
                 elif c == "show ntp" or c == "show ntp detail":
                     logger.info(f"コマンド正規化: '{cmd}' → 'show ntp status'")
@@ -983,6 +1181,23 @@ class AristaEapiShowExecutor(AgentExecutor):
                            "show ntp peer", "show ntp server"):
                     logger.info(f"コマンド正規化: '{cmd}' → 'show ntp associations'")
                     normalized_cmds.append("show ntp associations")
+
+                # MPLS 正規化（LLM が誤って routes と複数形を生成するケースを修正）
+                elif c == "show mpls routes":
+                    logger.info(f"コマンド正規化: 'show mpls routes' → 'show mpls route'")
+                    normalized_cmds.append("show mpls route")
+
+                elif c == "show mpls lfib routes":
+                    logger.info(f"コマンド正規化: 'show mpls lfib routes' → 'show mpls lfib route'")
+                    normalized_cmds.append("show mpls lfib route")
+
+                # show environment temperature → show system environment temperature
+                # 注意: show system environment は Incomplete command のため正規化対象
+                elif c in ("show environment temperature",
+                           "show environment",
+                           "show system environment"):
+                    logger.info(f"コマンド正規化: '{cmd}' → 'show system environment temperature'")
+                    normalized_cmds.append("show system environment temperature")
 
                 else:
                     normalized_cmds.append(cmd)
@@ -995,20 +1210,28 @@ class AristaEapiShowExecutor(AgentExecutor):
             raw_result = node.run_commands(cmds, encoding="json")
 
             # ⑤ ハイブリッドパース:
-            #    structured パース（既定フォーマット対応コマンド）→ None なら LLM パース
+            #    structured パース → None なら text フォーマットで再取得 → LLM パース
+            #    text フォーマット非対応なら JSON を LLM パース（8000字制限・最終手段）
             structured_text = _format_interfaces(raw_result)
 
             if structured_text is not None:
-                # 既定フォーマット対応コマンド: structured パース結果を使用
+                # structured パース成功
                 parse_method   = "structured"
                 formatted_text = structured_text
                 logger.info(f"パース方式: structured ({cmds})")
             else:
-                # 未対応コマンド（show interfaces counters 等）:
-                # raw データを LLM に送って整形させる
-                logger.info(f"パース方式: LLM ({cmds}) — structured パース未対応")
-                formatted_text = await _llm_format_raw(cmds, raw_result, self._llm)
-                parse_method   = "llm"
+                # structured パース未対応 → text フォーマットで再取得して LLM に渡す
+                logger.info(f"パース方式: text+LLM フォールバック ({cmds})")
+                try:
+                    text_result = node.run_commands(cmds, encoding="text")
+                    formatted_text = await _llm_format_text(cmds, text_result, self._llm)
+                    parse_method   = "text+llm"
+                    logger.info(f"パース方式: text+LLM 成功 ({cmds})")
+                except Exception as e:
+                    # text フォーマット非対応 → JSON LLM パース（最終手段）
+                    logger.warning(f"text フォーマット非対応: {e} → JSON LLM パース（8000字制限）")
+                    formatted_text = await _llm_format_raw(cmds, raw_result, self._llm)
+                    parse_method   = "json+llm(fallback)"
 
             response_payload = {
                 "query":          query,
@@ -1089,6 +1312,7 @@ async def api_session_diff(req: _SessionDiffRequest):
     """
     NETCONF XML を受け取り、configure session で +/- diff を取得して返す。
     running-config は変更しない（abort で確実にロールバック）。
+    ai_summary: EOS diff または XML を LLM が自然言語に要約した結果を追加。
     """
     import asyncio
     loop = asyncio.get_event_loop()
@@ -1103,6 +1327,14 @@ async def api_session_diff(req: _SessionDiffRequest):
             password=req.password,
         )
     )
+    # LLM による変更要約を追加
+    llm = build_llm_with_fallback()
+    ai_summary = await _llm_summarize_diff(
+        diff_text=result.get("diff_text", ""),
+        xml_str=req.xml_str,
+        llm=llm,
+    )
+    result["ai_summary"] = ai_summary
     return result
 
 

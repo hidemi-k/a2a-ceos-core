@@ -1,0 +1,40 @@
+# ============================================================
+# requirements.txt — maf-a2a-ceos
+# Python 3.11+
+# 動作確認済み環境のバージョンに完全固定
+# ============================================================
+ 
+# ── UI Framework ─────────────────────────────────────────────
+nicegui==3.10.0
+ 
+# ── A2A Protocol ─────────────────────────────────────────────
+# 注意: a2a-sdk 1.0.x で API が大幅変更（a2a.server.apps 廃止）
+# agent-framework-a2a も 1.0.0b260514 以降で a2a-sdk 1.0.x に移行
+# 動作確認済みの組み合わせに固定する
+a2a-sdk==0.3.23
+agent-framework==1.4.0
+ 
+# ── AI / LLM / RAG ──────────────────────────────────────────
+langchain-community==0.4.1
+langchain-core==1.2.28
+langchain-openai==1.1.12
+langchain-huggingface==1.2.1
+langchain-text-splitters==1.1.1
+faiss-cpu==1.13.2
+openai==2.31.0
+sentence-transformers==5.4.0
+ 
+# ── Web Framework（A2A サーバ共通） ──────────────────────────
+fastapi==0.135.3
+uvicorn==0.44.0
+starlette==1.0.0
+httpx==0.28.1
+pydantic==2.12.5
+ 
+# ── Network Automation（Arista） ─────────────────────────────
+ncclient==0.7.0          # NETCONF（arista_netconf_rag_a2a_server.py）
+pyeapi==1.0.4            # eAPI（arista_eapi_show_a2a_server.py）
+anta==1.8.0              # ANTA Post-Check（arista_anta_verify_a2a_server.py）
+ 
+# ── YAML / 設定ファイル ──────────────────────────────────────
+pyyaml                   # policy_arista.yaml（標準的で変更少ないため上限なし）

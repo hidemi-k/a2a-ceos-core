@@ -230,11 +230,22 @@ DEVICE = {
 }
 
 # ── Basic 認証 + レート制限 ────────────────────────────────────────────────────
-AUTH_USER      = os.getenv("BASIC_AUTH_USER", "judge")
-AUTH_PASS      = os.getenv("BASIC_AUTH_PASS", "hackathon2026")
+# 複数ユーザー対応: 環境変数をカンマ区切りでリスト化
+# 例: BASIC_AUTH_USER=admin,judge2  BASIC_AUTH_PASS=secure2026!,hackathon
+AUTH_USER      = [u.strip() for u in os.getenv("BASIC_AUTH_USER", "judge").split(",")]
+AUTH_PASS      = [p.strip() for p in os.getenv("BASIC_AUTH_PASS", "hackathon2026").split(",")]
 AUTH_REALM     = "Restricted"
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
 _rate_store: dict = defaultdict(list)
+
+# ユーザー数とパスワード数が一致しない場合は警告
+if len(AUTH_USER) != len(AUTH_PASS):
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        f"[Auth] BASIC_AUTH_USER ({len(AUTH_USER)}件) と "
+        f"BASIC_AUTH_PASS ({len(AUTH_PASS)}件) の件数が一致しません。"
+        f"短い方に合わせて動作します。"
+    )
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -245,7 +256,11 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         try:
             decoded = base64.b64decode(auth[6:]).decode("utf-8")
             user, passwd = decoded.split(":", 1)
-            return user == AUTH_USER and passwd == AUTH_PASS
+            # 複数ユーザー対応: いずれかのユーザー/パスワードペアに一致すれば OK
+            for u, p in zip(AUTH_USER, AUTH_PASS):
+                if user == u and passwd == p:
+                    return True
+            return False
         except Exception:
             return False
 
@@ -294,8 +309,10 @@ C = {
     "border":     "rgba(255,255,255,0.08)",
     "border2":    "rgba(255,255,255,0.14)",
     "text":       "#e2e2e2",
+    "text1":      "#e2e2e2",
     "text2":      "#8a8a8a",
     "text3":      "#4a4a4a",
+    "primary":    "#4a8fc4",   # AI 変更要約の強調色（info_fg と同色）
     "success_bg": "#0f2318",
     "success_fg": "#5bb85b",
     "warn_bg":    "#251a08",
@@ -878,11 +895,21 @@ def _parse_execute_result(result: dict) -> dict:
         # dry-run 判定:
         #   deploy=False のとき NETCONFサーバは overall_status="dry_run" を返す
         #   xml は空だが、task_summaries があれば承認待ちへ遷移できる
+        #   ★ blocked タスクのみの場合は dry-run ではなく failure 扱い
+        non_blocked_tasks = [
+            ts for ts in task_summaries
+            if ts.get("deploy_status") != "blocked"
+        ]
+        all_blocked = bool(task_summaries) and len(non_blocked_tasks) == 0
+
         is_dry_run = (
-            "dry_run" in overall_status.lower()
-            or any(
-                ts.get("deploy_status") == "skipped"
-                for ts in task_summaries
+            not all_blocked
+            and (
+                "dry_run" in overall_status.lower()
+                or any(
+                    ts.get("deploy_status") == "skipped"
+                    for ts in non_blocked_tasks
+                )
             )
         )
 
@@ -1618,7 +1645,10 @@ def main():
                             # [修正] NETCONFサーバはdeploy=Falseのとき xml を返さない。
                             # 承認待ち遷移条件を is_dry_run フラグ + task_summaries の
                             # 存在で判定する（pending_xml の空チェックは廃止）。
-                            has_tasks = bool(p["task_summaries"])
+                            has_tasks = bool(p["task_summaries"]) and any(
+                                ts.get("deploy_status") != "blocked"
+                                for ts in p["task_summaries"]
+                            )
                             if (not is_read
                                     and not is_security
                                     and not is_verify      # ← Verify は承認フロー不要
@@ -2500,6 +2530,23 @@ def main():
                                     else:
                                         ui.label(L("no_diff")).style(
                                             f"font-size:11px;color:{C['text3']};"
+                                        )
+
+                                    # ── AI による変更要約 ──────────────────
+                                    _ai_summary = _sd.get("ai_summary", "")
+                                    if _ai_summary:
+                                        ui.html(
+                                            f'<div style="margin-top:8px;padding:8px 10px;'
+                                            f'background:{C["bg3"]};'
+                                            f'border-left:3px solid {C["primary"]};'
+                                            f'border-radius:0 6px 6px 0;'
+                                            f'font-size:12px;color:{C["text1"]};'
+                                            f'line-height:1.6;">'
+                                            f'<span style="font-size:10px;font-weight:600;'
+                                            f'color:{C["primary"]};letter-spacing:.04em;">'
+                                            f'🤖 AI 変更要約</span><br>'
+                                            + _ai_summary.replace("<","&lt;").replace(">","&gt;")
+                                            + "</div>"
                                         )
 
                                     # Deploy Diff (Audit 結果)

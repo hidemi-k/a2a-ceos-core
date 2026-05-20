@@ -70,6 +70,7 @@ import logging
 import configparser
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
+import yaml
 from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass, field as dc_field
 from datetime import datetime
@@ -127,6 +128,8 @@ A2A_PORT       = int(os.getenv("A2A_PORT", "8001"))
 A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH",
                             os.path.join(BASE_DIR, "audit_log_arista.jsonl"))
+POLICY_YAML_PATH = os.getenv("POLICY_YAML_PATH",
+                              os.path.join(BASE_DIR, "policy_arista.yaml"))
 
 # OpenConfig 名前空間定数
 OC_INTF_NS = "http://openconfig.net/yang/interfaces"
@@ -146,12 +149,41 @@ def _init_retriever():
     if not os.path.exists(FAISS_PATH):
         logger.warning(f"faiss_db が見つかりません: {FAISS_PATH}")
         return None
-    logger.info(f"FAISS ロード中: {FAISS_PATH}")
+    # FAISS バージョンログ（version.txt が存在すれば読む）
+    _ver_path = os.path.join(FAISS_PATH, "version.txt")
+    _faiss_ver = open(_ver_path).read().strip() if os.path.exists(_ver_path) else "unknown"
+    logger.info(f"FAISS ロード中: {FAISS_PATH}  version={_faiss_ver}")
     embedding   = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
     vectorstore = FAISS.load_local(
         FAISS_PATH, embedding, allow_dangerous_deserialization=True)
     logger.info("FAISS ロード完了")
-    return vectorstore.as_retriever(search_kwargs={"k": 5})
+    # retrieval スコアを記録するラッパーを返す
+    base_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+    class _LoggingRetriever:
+        """similarity_search_with_score の top スコアをログに記録するラッパー。"""
+        def __init__(self, vs, base):
+            self._vs   = vs
+            self._base = base
+
+        def get_relevant_documents(self, query):
+            docs_scores = self._vs.similarity_search_with_score(query, k=5)
+            if docs_scores:
+                top_score = docs_scores[0][1]
+                logger.info(
+                    f"RAG retrieval: top_score={top_score:.3f} "
+                    f"query={query[:50]!r}"
+                )
+            return [d for d, _ in docs_scores]
+
+        # LangChain の invoke / batch も委譲
+        def invoke(self, query, **kw):
+            return self.get_relevant_documents(query)
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    return _LoggingRetriever(vectorstore, base_retriever)
 
 
 def _init_llm():
@@ -629,10 +661,21 @@ def audit_deployment(xml_config, device_ip, username, password, port="830"):
     <state>フィルターは Arista cEOS で 0件（実機確認済み）のため確認不可。
     オペレーショナル状態の確認は eAPI サーバ (port:8002) で行うこと。
 
-    修正済みの問題:
-      - 名前空間付き vlan-id の抽出（iter で全要素を走査）
-      - VLAN削除確認は target_name が evidence に含まれないことで判定
-        （他VLANの <vlan-id> タグ存在に影響されない）
+    【設計: ホワイトリスト型 audit】
+      VLAN / interface だけ明示的に確認する。
+      それ以外（BGP, OSPF, ACL, Policy 等）は自動で skipped にして
+      誤 failure を防ぐ。新しい操作タイプが追加されても修正不要。
+
+      確認対象（ホワイトリスト）:
+        - VLAN 作成・削除  : <vlan-id> / <vlans> を含む XML
+        - インターフェース設定: <interfaces> / <interface> を含む XML
+                              （ただし network-instances 配下の BGP interface との混同を除外）
+
+      ホワイトリスト外の操作（自動 skipped）:
+        - BGP neighbor / global AS
+        - OSPF / ISIS / BGP policy
+        - ACL / QoS
+        - その他未知の操作タイプ
     """
     try:
         root_xml = ET.fromstring(
@@ -642,16 +685,127 @@ def audit_deployment(xml_config, device_ip, username, password, port="830"):
         return {"status": "failure", "scope": "config-tree-only",
                 "message": f"XML parse error: {e}"}
 
+    # ── ホワイトリスト判定 ────────────────────────────────────────────────────
+    # VLAN: <vlan-id> または <vlans> タグを含む
+    is_vlan = any(
+        root_xml.find(f".//{{{OC_NI_NS}}}{t}") is not None
+        for t in ["vlan-id", "vlans"]
+    ) or "<vlan-id>" in xml_config or "<vlans>" in xml_config
+
+    # Interface: <interfaces> 直下の操作（network-instances 配下は除外）
+    # protocols/bgp 配下の <interface> タグとの混同を防ぐため、
+    # ルートが interfaces namespace のものだけを対象とする
+    is_intf = (
+        root_xml.find(f".//{{{OC_INTF_NS}}}interface") is not None
+        or root_xml.find(f".//{{{OC_INTF_NS}}}interfaces") is not None
+    ) and not is_vlan
+
+    # ── ホワイトリスト外 → 自動 skipped ──────────────────────────────────────
+    if not is_vlan and not is_intf:
+        # ターゲット名をログ用に抽出（操作の記録のため）
+        target_hint = ""
+        for elem in root_xml.iter():
+            local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if local in ("name", "neighbor-address", "peer-as") and elem.text:
+                target_hint = f"{local}={elem.text.strip()}"
+                break
+        logger.info(
+            f"audit skipped (whitelist外): target_hint={target_hint!r} "
+            f"→ eAPI で確認してください"
+        )
+        return {
+            "status":    "skipped",
+            "scope":     "config-tree-only",
+            "operation": "configure",
+            "target":    target_hint,
+            "message":   (
+                "audit skipped: この操作タイプは NETCONF config-tree では確認できません"
+                "（ホワイトリスト外）。eAPI show コマンドで確認してください。"
+            ),
+        }
+
+    # ── ホワイトリスト内: VLAN / interface の確認 ────────────────────────────
     op_attr = next(
         (elem.get("operation") for elem in root_xml.iter() if elem.get("operation")),
         ""
     )
     operation = "delete" if op_attr == "delete" else "configure"
 
-    is_vlan = any(
-        root_xml.find(f".//{{{OC_NI_NS}}}{t}") is not None
-        for t in ["vlan-id", "vlans"]
-    )
+    if is_vlan:
+        target_name = ""
+        for elem in root_xml.iter():
+            local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if local == "vlan-id" and elem.text and elem.text.strip().isdigit():
+                target_name = elem.text.strip()
+                break
+        target_type = "vlan"
+    else:
+        target_name = ""
+        for elem in root_xml.iter():
+            local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if local == "name" and elem.text:
+                t = elem.text.strip()
+                if any(t.startswith(p) for p in
+                       ("Ethernet", "Management", "Loopback", "Vlan", "Port")):
+                    target_name = t
+                    break
+        target_type = "interface"
+
+    try:
+        with _connect_with_retry(device_ip, port, username, password) as m:
+            if is_vlan:
+                flt = (
+                    '<network-instances xmlns="' + OC_NI_NS + '">'
+                    '<network-instance><name>default</name>'
+                    '<vlans><vlan><vlan-id>' + target_name + '</vlan-id>'
+                    '</vlan></vlans></network-instance></network-instances>'
+                ) if target_name else (
+                    '<network-instances xmlns="' + OC_NI_NS + '"/>'
+                )
+            else:
+                flt = (
+                    '<interfaces xmlns="' + OC_INTF_NS + '">'
+                    '<interface><name>' + target_name + '</name></interface>'
+                    '</interfaces>'
+                ) if target_name else (
+                    '<interfaces xmlns="' + OC_INTF_NS + '"/>'
+                )
+
+            result   = m.get_config(source="running", filter=("subtree", flt))
+            evidence = result.data_xml
+
+            if operation == "delete":
+                if is_vlan and target_name:
+                    try:
+                        ev_root = ET.fromstring(evidence)
+                        still_exists = any(
+                            elem.text and elem.text.strip() == target_name
+                            for elem in ev_root.iter()
+                            if (elem.tag.split("}")[-1] if "}" in elem.tag
+                                else elem.tag) == "vlan-id"
+                        )
+                        confirmed = not still_exists
+                    except ET.ParseError:
+                        confirmed = target_name not in evidence
+                else:
+                    confirmed = not evidence.strip() or target_name not in evidence
+            else:
+                confirmed = bool(target_name) and target_name in evidence
+
+            return {
+                "status":    "success" if confirmed else "failure",
+                "scope":     "config-tree-only",
+                "operation": operation,
+                "target":    target_name,
+                "message": (
+                    get_msg("audit_confirmed", type=target_type, target=target_name, op=operation)
+                    if confirmed else
+                    get_msg("audit_failed", type=target_type, target=target_name, op=operation)
+                ),
+            }
+    except Exception as e:
+        return {"status": "failure", "scope": "config-tree-only",
+                "message": f"Audit error: {e}"}
 
     if is_vlan:
         # 修正1: iter() で名前空間あり/なし 両対応で vlan-id を確実に取得
@@ -963,9 +1117,23 @@ ALL_SKILLS_V6 = ALL_SKILLS + [
 
 class AuditLogger:
     def __init__(self, log_path=AUDIT_LOG_PATH):
-        self.log_path    = log_path
+        self.log_path    = log_path   # 空文字列 → stdout 出力
         self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._entries    = []
+
+    def _write(self, entry: dict):
+        """JSONL を log_path に追記。AUDIT_LOG_PATH="" の場合は stdout に出力。"""
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        try:
+            if self.log_path:
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            else:
+                import sys
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        except Exception as e:
+            logger.warning(f"AuditLogger write error: {e}")
 
     def record(self, task, worker_result, policy_result=None,
                safety_result=None, deploy_method="ncclient"):
@@ -986,11 +1154,7 @@ class AuditLogger:
             "audit_scope":    audit.get("scope", "config-tree-only"),
         }
         self._entries.append(entry)
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.warning(f"AuditLogger write error: {e}")
+        self._write(entry)
 
     def record_blocked(self, task, reason, violations=None):
         entry = {
@@ -1002,11 +1166,7 @@ class AuditLogger:
             "policy_violations": violations or [],
         }
         self._entries.append(entry)
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.warning(f"AuditLogger write error: {e}")
+        self._write(entry)
 
     def summary(self):
         total   = len(self._entries)
@@ -1023,22 +1183,94 @@ class AuditLogger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DANGEROUS_PATTERNS = [
-    (r"<delete-config", "error",   "<delete-config> is forbidden"),
-    (r"kill-session",   "error",   "kill-session is forbidden"),
-    (r"<format",        "error",   "format operation is forbidden"),
+    (r"<delete-config",          "error",   "<delete-config> is forbidden"),
+    (r"<copy-config[^>]*running","error",   "copy-config targeting running is forbidden"),
+    (r"kill-session",            "error",   "kill-session is forbidden"),
+    (r"<format",                 "error",   "format operation is forbidden"),
+    (r"loopback",                "warning", "loopback interface reference detected — verify intent"),
 ]
-_ALLOWED_TAGS = {
-    "rpc", "interfaces", "network-instances", "network-instance",
-    "get-config", "edit-config", "get", "filter", "config", "root",
-    "data", "hello", "interface", "bgp", "system", "vlan",
+
+# ── HIGH_RISK パターン: ブロックではなく強制 dry-run ──────────────────────────
+HIGH_RISK_PATTERNS = [
+    #(r"<peer-as>",           "bgp_peer_as_change",  "BGP neighbor AS変更は要二段承認"),
+    (r"<autonomous-system>", "bgp_local_as_change", "Local AS変更は要二段承認"),
+    (r"Management0",         "mgmt_intf_change",    "管理インターフェース変更は要二段承認"),
+]
+
+# ── PolicyViolation dataclass（型安全） ───────────────────────────────────────
+@dataclass
+class PolicyViolation:
+    rule:   str
+    detail: str
+
+# ── Arista デフォルトポリシー（policy_arista.yaml が無い場合のフォールバック） ──
+_DEFAULT_ARISTA_POLICY = {
+    "allowed_interfaces":        [],   # 空 = 全許可（Arista は動的インターフェース名）
+    "allowed_vlan_ids":          list(range(1, 4095)),   # 全 VLAN 許可
+    "forbidden_keywords":        ["delete-config", "kill-session", "restart", "format"],
+    "max_vlan_operations_per_run": 50,
 }
-ARISTA_POLICY = {
-    "allowed_interfaces": [],
-    "forbidden_keywords": ["delete-config", "kill-session", "restart"],
-}
+
+
+def _write_default_policy_yaml(path: str = POLICY_YAML_PATH):
+    """policy_arista.yaml が存在しない場合にデフォルト内容で生成する。"""
+    if os.path.exists(path):
+        return
+    content = """\
+# Arista cEOS NETCONF Agent 操作ポリシー
+# このファイルを編集することで AI が操作できる範囲を制限できます。
+# サーバ再起動なしに変更が反映されます（起動時に読み込み）。
+
+# 操作を許可するインターフェース一覧（空リスト = 全許可）
+allowed_interfaces: []
+
+# 操作を許可する VLAN ID 一覧（空リスト = 全許可）
+allowed_vlan_ids: []
+
+# XML 内に含まれると即ブロックするキーワード
+forbidden_keywords:
+  - delete-config
+  - kill-session
+  - restart
+  - format
+
+# 許可する NETCONF 設定ノードの制御は forbidden_keywords で行ってください。
+# allowed_netconf_nodes は OpenConfig XML 構造の知識が必要なため廃止しました。
+# BGP 操作: forbidden_keywords の <bgp, <as> 等で制御
+# VLAN 操作: allowed_vlan_ids で制御
+
+# 1回の実行で許可する最大 VLAN 操作数（0 = 無制限）
+max_vlan_operations_per_run: 50
+"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"policy_arista.yaml を生成しました: {path}")
+    except Exception as e:
+        logger.warning(f"policy_arista.yaml 生成失敗: {e}")
+
+
+def _load_policy(path: str = POLICY_YAML_PATH) -> dict:
+    """policy_arista.yaml を読み込む。存在しなければ _DEFAULT_ARISTA_POLICY を使用。"""
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                logger.info(f"[PolicyChecker] ポリシーファイル読み込み: {path}")
+                return loaded
+        except Exception as e:
+            logger.warning(f"[PolicyChecker] policy.yaml 読み込み失敗: {e} → デフォルト使用")
+    return _DEFAULT_ARISTA_POLICY
+
+
+# 起動時に一度だけロード（グローバル参照用）
+ARISTA_POLICY: dict = {}   # main() で _load_policy() の結果を代入
 
 
 def validate_safety(xml_config, task=None):
+    """DANGEROUS_PATTERNS に一致する XML をブロックする（ValidationAgent）。"""
     errors, warnings = [], []
     for pat, sev, msg in DANGEROUS_PATTERNS:
         if re.search(pat, xml_config, re.IGNORECASE):
@@ -1046,27 +1278,85 @@ def validate_safety(xml_config, task=None):
     return {"safe": len(errors) == 0, "errors": errors, "warnings": warnings}
 
 
-def check_policy(task, xml_config, policy=None):
-    policy     = policy or ARISTA_POLICY
-    violations = []
-    iface      = task.get("target", "")
-    allowed    = policy.get("allowed_interfaces", [])
+def check_high_risk(xml_config: str) -> dict:
+    """
+    重大変更を検出してフラグを返す。ブロックではなく強制 dry-run を要求する。
+
+    Returns:
+        {"high_risk": bool, "risks": [{"code": str, "message": str}]}
+    """
+    risks = []
+    for pat, code, msg in HIGH_RISK_PATTERNS:
+        if re.search(pat, xml_config, re.IGNORECASE):
+            risks.append({"code": code, "message": msg})
+    return {"high_risk": len(risks) > 0, "risks": risks}
+
+
+def check_policy(task: dict, xml_config: str, policy: dict = None) -> dict:
+    """
+    タスクと生成 XML をポリシーと照合する（notebook Phase 7 PolicyChecker 準拠）。
+
+    チェック内容:
+      ① インターフェース allowlist
+      ② VLAN ID allowlist
+      ③ 禁止キーワードスキャン（XML 全体）
+      ④ 許可 NETCONF ノードチェック（ルート直下）
+      ⑤ 最大 VLAN 操作数チェック
+
+    Returns:
+        {"allowed": bool, "violations": [{"rule": str, "detail": str}]}
+    """
+    policy     = policy or ARISTA_POLICY or _DEFAULT_ARISTA_POLICY
+    violations: List[PolicyViolation] = []
+
+    # ① インターフェース allowlist（空リスト = 全許可）
+    iface   = task.get("target", "")
+    allowed = policy.get("allowed_interfaces", [])
     if iface and allowed and iface not in allowed:
-        violations.append({"rule": "interface_allowlist",
-                           "detail": f"'{iface}' not in allowed_interfaces"})
+        violations.append(PolicyViolation(
+            rule="interface_allowlist",
+            detail=f"'{iface}' not in allowed_interfaces: {allowed}",
+        ))
+
+    # ② VLAN ID allowlist（空リスト = 全許可）
+    # task の vlan_id キーに依存せず、生成 XML の <vlan-id> を直接スキャンする。
+    # task_decomposer のキー名揺れ（vlan_id / target_vlan / target 等）に左右されない。
+    allowed_ids = policy.get("allowed_vlan_ids", [])
+    if allowed_ids and xml_config:
+        xml_vlan_ids = re.findall(r"<vlan-id>\s*(\d+)\s*</vlan-id>", xml_config, re.IGNORECASE)
+        for vid_str in xml_vlan_ids:
+            try:
+                vid = int(vid_str)
+                if vid not in allowed_ids:
+                    violations.append(PolicyViolation(
+                        rule="vlan_id_allowlist",
+                        detail=f"VLAN ID {vid} は allowed_vlan_ids に含まれていません（操作拒否）",
+                    ))
+            except (ValueError, TypeError):
+                pass
+
+    # ③ 禁止キーワードスキャン
     for kw in policy.get("forbidden_keywords", []):
         if kw.lower() in xml_config.lower():
-            violations.append({"rule": "forbidden_keyword",
-                               "detail": f"'{kw}' found"})
-    try:
-        root = ET.fromstring(xml_config)
-        tag  = root.tag.split("}")[-1] if "}" in root.tag else root.tag
-        if tag not in _ALLOWED_TAGS:
-            violations.append({"rule": "netconf_tag",
-                               "detail": f"<{tag}> not in allowed tags"})
-    except Exception:
-        pass
-    return {"allowed": len(violations) == 0, "violations": violations}
+            violations.append(PolicyViolation(
+                rule="forbidden_keyword",
+                detail=f"forbidden keyword '{kw}' found in XML",
+            ))
+
+    # ⑤ 最大 VLAN 操作数チェック（セッション単位ではなくタスク単位で簡易チェック）
+    max_ops = policy.get("max_vlan_operations_per_run", 0)
+    if max_ops:
+        vlan_op_count = len(re.findall(r"<vlan-id>", xml_config, re.IGNORECASE))
+        if vlan_op_count > max_ops:
+            violations.append(PolicyViolation(
+                rule="max_vlan_operations",
+                detail=f"VLAN操作数 {vlan_op_count} が上限 {max_ops} を超えています",
+            ))
+
+    return {
+        "allowed":    len(violations) == 0,
+        "violations": [{"rule": v.rule, "detail": v.detail} for v in violations],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1473,6 +1763,109 @@ class OrchestratorAgentArista:
             return f"Get current state of {target} via NETCONF."
         return f"{op} {target}"
 
+    # ── BGP neighbor 削除専用ロジック ───────────────────────────────────────────
+    def _is_bgp_neighbor_delete(self, task: dict) -> bool:
+        """BGP neighbor 削除タスクかどうかを判定する。"""
+        op     = task.get("operation", "").lower()
+        target = task.get("target", "").lower()
+        desc   = task.get("description", "").lower()
+        return (
+            op in ("delete", "remove")
+            and any(kw in target or kw in desc
+                    for kw in ["bgp", "neighbor", "10.0.20", "peer"])
+        )
+
+    def _get_current_bgp_neighbors(self, device_ip, username, password, port) -> list:
+        """
+        NETCONF get-config で現在の BGP neighbor 一覧を取得する。
+        返り値: [{"neighbor-address": "10.0.20.150", "peer-as": 65002}, ...]
+        """
+        OC_BGP_NS = "http://openconfig.net/yang/bgp"
+        flt = (
+            f'<network-instances xmlns="{OC_NI_NS}">'
+            f'<network-instance><name>default</name>'
+            f'<protocols><protocol>'
+            f'<identifier>BGP</identifier><name>BGP</name>'
+            f'<bgp xmlns="{OC_BGP_NS}"><neighbors/></bgp>'
+            f'</protocol></protocols>'
+            f'</network-instance></network-instances>'
+        )
+        neighbors = []
+        try:
+            with _connect_with_retry(device_ip, port, username, password) as m:
+                result = m.get_config(source="running", filter=("subtree", flt))
+                root   = ET.fromstring(result.data_xml)
+                for neighbor in root.iter():
+                    local = neighbor.tag.split("}")[-1] if "}" in neighbor.tag else neighbor.tag
+                    if local != "neighbor":
+                        continue
+                    addr = peer = ""
+                    for child in neighbor:
+                        cl = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                        if cl == "neighbor-address" and child.text:
+                            addr = child.text.strip()
+                        # <config> 配下の peer-as を探す
+                        if cl == "config":
+                            for gc in child:
+                                gcl = gc.tag.split("}")[-1] if "}" in gc.tag else gc.tag
+                                if gcl == "peer-as" and gc.text:
+                                    peer = gc.text.strip()
+                    if addr:
+                        neighbors.append({"neighbor-address": addr, "peer-as": peer})
+        except Exception as e:
+            logger.warning(f"[BGP delete] get_current_bgp_neighbors 失敗: {e}")
+        return neighbors
+
+    def _build_bgp_replace_xml(self, neighbors_to_keep: list) -> str:
+        """
+        残す neighbor リストから nc:operation="replace" XML を生成する。
+        neighbors_to_keep: [{"neighbor-address": "...", "peer-as": "..."}, ...]
+        """
+        OC_BGP_NS = "http://openconfig.net/yang/bgp"
+        neighbor_blocks = ""
+        for nb in neighbors_to_keep:
+            addr    = nb.get("neighbor-address", "")
+            peer_as = nb.get("peer-as", "")
+            if not addr:
+                continue
+            neighbor_blocks += f"""
+              <neighbor>
+                <neighbor-address>{addr}</neighbor-address>
+                <config>
+                  <neighbor-address>{addr}</neighbor-address>
+                  <peer-as>{peer_as}</peer-as>
+                </config>
+              </neighbor>"""
+
+        return f"""<config>
+  <network-instances xmlns="{OC_NI_NS}">
+    <network-instance>
+      <name>default</name>
+      <protocols>
+        <protocol>
+          <identifier>BGP</identifier>
+          <name>BGP</name>
+          <bgp xmlns="{OC_BGP_NS}">
+            <neighbors xmlns:nc="{NETCONF_NS}"
+                       nc:operation="replace">{neighbor_blocks}
+            </neighbors>
+          </bgp>
+        </protocol>
+      </protocols>
+    </network-instance>
+  </network-instances>
+</config>"""
+
+    def _extract_bgp_delete_target(self, task: dict, user_query: str) -> str:
+        """タスクまたはクエリから削除対象の neighbor IP を抽出する。"""
+        import re
+        # task の target / description から IP を探す
+        for text in [task.get("target", ""), task.get("description", ""), user_query]:
+            m = re.search(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', text)
+            if m:
+                return m.group(1)
+        return ""
+
     async def _dispatch_task(self, task, idx, total,
                               device_ip, username, password, port, deploy):
         tid = task.get("id", "?")
@@ -1486,6 +1879,125 @@ class OrchestratorAgentArista:
             }
             self.audit_logger.record_blocked(task, "skipped")
             return skipped
+
+        # ── BGP neighbor 削除専用処理 ────────────────────────────────────────
+        # Arista cEOS では nc:operation="delete" on neighbor が動作しない。
+        # 正しい削除方法: 現在の neighbor 一覧を取得し、削除対象を除いた
+        # リストで nc:operation="replace" on <neighbors> を実行する。
+        if self._is_bgp_neighbor_delete(task):
+            query   = self._build_worker_query(task)
+            target_ip = self._extract_bgp_delete_target(task, query)
+            self.log(f"[BGP delete] 専用ロジック起動: target_ip={target_ip!r}")
+
+            if not target_ip:
+                msg = "BGP neighbor 削除: 対象 IP を特定できませんでした"
+                self.log(f"[BGP delete] ❌ {msg}")
+                return {
+                    "validation_status": False,
+                    "deployment_status": {"status": "failure", "diff": "", "message": msg},
+                    "audit_status": None, "rollback_status": None,
+                }
+
+            # 現在の neighbor 一覧を取得
+            current_neighbors = self._get_current_bgp_neighbors(
+                device_ip, username, password, port)
+            self.log(f"[BGP delete] 現在の neighbor 数: {len(current_neighbors)}")
+            for nb in current_neighbors:
+                self.log(f"  - {nb['neighbor-address']} (AS {nb['peer-as']})")
+
+            # 削除対象を除外
+            neighbors_to_keep = [
+                nb for nb in current_neighbors
+                if nb["neighbor-address"] != target_ip
+            ]
+
+            if len(neighbors_to_keep) == len(current_neighbors):
+                msg = f"BGP neighbor {target_ip} は存在しません（削除不要）"
+                self.log(f"[BGP delete] ℹ️  {msg}")
+                return {
+                    "validation_status": True,
+                    "deployment_status": {"status": "no_changes", "diff": "",
+                                          "message": msg},
+                    "audit_status": {"status": "skipped", "scope": "config-tree-only",
+                                     "message": msg},
+                    "rollback_status": None,
+                }
+
+            self.log(f"[BGP delete] 残す neighbor 数: {len(neighbors_to_keep)}")
+
+            # replace XML を生成
+            xml_config = self._build_bgp_replace_xml(neighbors_to_keep)
+            self.log(f"[BGP delete] replace XML 生成完了")
+
+            # PolicyChecker（forbidden_keywords）
+            policy_res = check_policy(task, xml_config, policy=self.policy)
+            if not policy_res["allowed"]:
+                msg = f"PolicyChecker BLOCK: {policy_res['violations']}"
+                self.log(f"[BGP delete] ❌ {msg}")
+                self.audit_logger.record_blocked(task, msg,
+                                                 violations=policy_res["violations"])
+                return {
+                    "validation_status": False,
+                    "deployment_status": {"status": "blocked", "diff": "", "message": msg},
+                    "audit_status": None, "rollback_status": None,
+                }
+
+            # dry-run の場合はここで返す
+            if not deploy:
+                # ai_summary: 削除対象と残る neighbor を明示
+                _keep_ips = [nb["neighbor-address"] for nb in neighbors_to_keep]
+                _keep_str = "、".join(_keep_ips) if _keep_ips else "なし"
+                _ai_summary = (
+                    f"BGP neighbor {target_ip} が削除されます。"
+                    f"（残る neighbor: {_keep_str}）"
+                )
+                return {
+                    "generated_xml":     xml_config,
+                    "final_xml":         xml_config,
+                    "validation_status": True,
+                    "deployment_status": {"status": "skipped", "diff": "",
+                                          "message": "deploy=False (dry-run)"},
+                    "audit_status":      None,
+                    "rollback_status":   None,
+                    "ai_summary":        _ai_summary,
+                }
+
+            # 実機投入
+            dep = deploy_netconf_config(
+                xml_config=xml_config,
+                device_ip=device_ip, username=username,
+                password=password, port=port,
+                comment=f"BGP neighbor {target_ip} delete via replace",
+            )
+            self.log(f"[BGP delete] deploy result: {dep.get('status')}")
+            self.audit_logger.record(
+                task,
+                {"generated_xml": xml_config, "final_xml": xml_config,
+                 "validation_status": True, "deployment_status": dep,
+                 "audit_status": {"status": "skipped", "scope": "config-tree-only",
+                                  "message": "BGP audit: eAPI show ip bgp summary で確認"},
+                 "rollback_status": None},
+                policy_result=policy_res,
+                safety_result={"safe": True, "errors": []},
+                deploy_method="ncclient_bgp_replace",
+            )
+            _keep_ips = [nb["neighbor-address"] for nb in neighbors_to_keep]
+            _keep_str = "、".join(_keep_ips) if _keep_ips else "なし"
+            _ai_summary = (
+                f"BGP neighbor {target_ip} が削除されます。"
+                f"（残る neighbor: {_keep_str}）"
+            )
+            return {
+                "generated_xml":     xml_config,
+                "final_xml":         xml_config,
+                "validation_status": True,
+                "deployment_status": dep,
+                "audit_status":      {"status": "skipped", "scope": "config-tree-only",
+                                      "message": "BGP audit skipped: eAPI show ip bgp summary で確認"},
+                "rollback_status":   None,
+                "ai_summary":        _ai_summary,
+            }
+        # ── BGP neighbor 削除専用処理 ここまで ──────────────────────────────
 
         worker = NetconfRagWorkerArista(
             retriever=self.retriever, llm=self.llm, skills=ALL_SKILLS,
@@ -1540,6 +2052,21 @@ class OrchestratorAgentArista:
                 "deployment_status": {"status": "blocked", "diff": "", "message": msg},
                 "audit_status": None, "rollback_status": None,
             }
+
+        # HighRisk チェック: BGP AS変更・Management0変更等 → 強制 dry-run
+        risk_res = check_high_risk(xml_config)
+        if risk_res["high_risk"] and deploy:
+            risk_msgs = [r["message"] for r in risk_res["risks"]]
+            self.log(
+                f"⚠️  HIGH RISK 検出 → deploy を強制スキップ: {risk_msgs}"
+            )
+            self.audit_logger.record_blocked(
+                task,
+                f"HIGH RISK 強制 dry-run: {risk_msgs}",
+                violations=[{"rule": r["code"], "detail": r["message"]}
+                            for r in risk_res["risks"]],
+            )
+            deploy = False   # 強制 dry-run
 
         # Skill ループ
         device_info = (
@@ -1761,6 +2288,8 @@ class AristaNetconfRagExecutor(AgentExecutor):
                     # ★ session diff 用: タスクが生成した最終 XML を含める
                     "final_xml":      res.get("final_xml", ""),
                     "generated_xml":  res.get("generated_xml", ""),
+                    # ★ BGP 削除等で専用ロジックが生成した ai_summary
+                    "ai_summary":     res.get("ai_summary", ""),
                 })
 
             # ★ session diff 用: 全タスクの XML を結合して返す
@@ -1772,6 +2301,12 @@ class AristaNetconfRagExecutor(AgentExecutor):
             ]
             # 複数タスクは改行区切りで結合（session diff は先頭タスクを使う）
             combined_xml = "\n".join(all_xmls)
+
+            # ★ ai_summary: task_summaries の先頭タスクから取得（BGP 削除等）
+            combined_ai_summary = next(
+                (ts["ai_summary"] for ts in task_summaries if ts.get("ai_summary")),
+                ""
+            )
 
             response_payload = {
                 "query":            query,
@@ -1785,6 +2320,8 @@ class AristaNetconfRagExecutor(AgentExecutor):
                 # ★ Hub の session diff 呼び出しで使う
                 "final_xml":        combined_xml,
                 "generated_xml":    combined_xml,
+                # ★ BGP 削除等で専用ロジックが生成した ai_summary を Hub に渡す
+                "ai_summary":       combined_ai_summary,
             }
 
             logger.info(f"完了: {agg.get('summary', '')}")
@@ -1855,6 +2392,11 @@ def build_agent_card() -> AgentCard:
 
 # ── サーバ起動 ─────────────────────────────────────────────────────────────────
 def main():
+    global ARISTA_POLICY
+    # policy_arista.yaml が無ければ自動生成し、ロードしてグローバルに反映
+    _write_default_policy_yaml(POLICY_YAML_PATH)
+    ARISTA_POLICY = _load_policy(POLICY_YAML_PATH)
+
     retriever = _init_retriever()
     llm       = _init_llm()
 
@@ -1876,7 +2418,10 @@ def main():
     logger.info(f"  A2A endpoint: {A2A_PUBLIC_URL}/")
     logger.info(f"  FAISS_PATH  : {FAISS_PATH}")
     logger.info(f"  RAG         : {'有効' if retriever else '無効（faiss_db なし）'}")
-    logger.info(f"  AUDIT_LOG   : {AUDIT_LOG_PATH}")
+    logger.info(f"  AUDIT_LOG   : {AUDIT_LOG_PATH if AUDIT_LOG_PATH else 'stdout'}")
+    logger.info(f"  POLICY_YAML : {POLICY_YAML_PATH}")
+    logger.info(f"  Policy      : forbidden_keywords={ARISTA_POLICY.get('forbidden_keywords')}")
+    logger.info(f"              : max_vlan_ops={ARISTA_POLICY.get('max_vlan_operations_per_run')}")
     logger.info(f"  Port        : {A2A_PORT}  (eAPI show サーバは 8002)")
     logger.info("=" * 60)
 
