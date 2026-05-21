@@ -53,7 +53,7 @@
 ┌─────────────────────────────────────────────────────┐
 │            Azure Container Apps                      │
 │  ┌────────────────────────────────────────────────┐  │
-│  │  app_a2a.py (NiceGUI Web UI / port:8088)       │  │
+│  │  app_a2a.py (NiceGUI Web UI / port:8080)       │  │
 │  │  ・自然言語入力 → REST POST /execute           │  │
 │  │  ・Dry-run → Diff 確認 → 承認デプロイ          │  │
 │  │  ・ANTA Verify タブ / Security タブ            │  │
@@ -85,6 +85,9 @@
 └─────────────────────────────────────────────────────┘
 ```
 
+> **通信経路の補足**
+> Security タブのリアルタイム表示（Top Traffic・Drop List・QoS List）は A2A Hub を経由せず、Web UI から Go IPS（:8080）へ直接 GET します。チャット入力からのセキュリティ操作は Hub → XDP Agent（:8003）→ Go IPS の順に処理されます。
+
 ### Azure 構成
 
 | コンポーネント | Azure サービス | 役割 |
@@ -95,7 +98,7 @@
 | eAPI Agent | Azure VM | 状態参照 + Diff エンジン (port:8002) |
 | XDP Agent | Azure VM | セキュリティ制御 (port:8003) |
 | ANTA Agent | Azure VM | 事後検証 (port:8004) |
-| Go IPS | Azure VM | eBPF/XDP REST API (port:8080) |
+| Go IPS | Azure VM | eBPF/XDP REST API (port:8080)。`-iface eth2` で ceos1 の eth2 に XDP/eBPF をアタッチ |
 | LLM Primary | Groq | llama-3.3-70b-versatile（高速推論） |
 | LLM Fallback | Azure OpenAI | gpt-4.1-mini（プライベートエンドポイント） |
 | エージェント基盤 | **Microsoft Agent Framework** | NETCONF Agent の LLM クライアント層 |
@@ -203,6 +206,7 @@ Azure VM (172.20.100.0/24 — clab-mgmt)
 ├── ceos1  (Arista cEOS 4.36.0F)   172.20.100.31
 │     ├── eth1 ─── 10.0.20.3/24 ──── linux1:eth1 (10.0.20.150)  FRRouting BGP
 │     └── eth2 ─── 10.0.3.3/24  ──── kali1:eth2  (10.0.3.150)   Kali Linux（攻撃元）
+│                                      ↑ Go IPS が eth2 に XDP/eBPF をアタッチ（-iface eth2）
 │
 ├── linux1 (Alpine + FRRouting)     172.20.100.3
 │     BGP AS 65002 — neighbor 10.0.20.3 (ceos1 AS 65001)

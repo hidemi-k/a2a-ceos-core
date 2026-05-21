@@ -53,7 +53,7 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 ┌─────────────────────────────────────────────────────┐
 │            Azure Container Apps                      │
 │  ┌────────────────────────────────────────────────┐  │
-│  │  app_a2a.py (NiceGUI Web UI / port:8088)       │  │
+│  │  app_a2a.py (NiceGUI Web UI / port:8080)       │  │
 │  │  · Natural language input → REST POST /execute │  │
 │  │  · Dry-run → Diff review → Approve & Deploy    │  │
 │  │  · ANTA Verify tab / Security tab              │  │
@@ -85,6 +85,10 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 └─────────────────────────────────────────────────────┘
 ```
 
+> **Communication path note**
+> Security tab real-time display (Top Traffic / Drop List / QoS List) polls Go IPS (:8080) **directly** from the Web UI — bypassing the A2A Hub.
+> Security operations triggered via chat go through Hub → XDP Agent (:8003) → Go IPS as usual.
+
 ### Azure components
 
 | Component | Azure service | Role |
@@ -95,7 +99,7 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 | eAPI Agent | Azure VM | State query + Diff engine (port:8002) |
 | XDP Agent | Azure VM | Security control (port:8003) |
 | ANTA Agent | Azure VM | Post-verification (port:8004) |
-| Go IPS | Azure VM | eBPF/XDP REST API (port:8080) |
+| Go IPS | Azure VM | eBPF/XDP REST API (port:8080). Attaches XDP/eBPF to ceos1 eth2 via `-iface eth2` |
 | LLM Primary | Groq | llama-3.3-70b-versatile (low-latency inference) |
 | LLM Fallback | Azure OpenAI | gpt-4.1-mini (private endpoint) |
 | Agent framework | **Microsoft Agent Framework** | LLM client layer for NETCONF Agent |
@@ -204,6 +208,7 @@ Azure VM (172.20.100.0/24 — clab-mgmt)
 ├── ceos1  (Arista cEOS 4.36.0F)   172.20.100.31
 │     ├── eth1 ─── 10.0.20.3/24 ──── linux1:eth1 (10.0.20.150)  FRRouting BGP peer
 │     └── eth2 ─── 10.0.3.3/24  ──── kali1:eth2  (10.0.3.150)   Kali Linux (attacker)
+│                                      ↑ Go IPS attaches XDP/eBPF to eth2 (-iface eth2)
 │
 ├── linux1 (Alpine + FRRouting)     172.20.100.3
 │     BGP AS 65002 — neighbor 10.0.20.3 (ceos1 AS 65001)
