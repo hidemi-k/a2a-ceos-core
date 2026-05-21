@@ -656,16 +656,72 @@ class XdpFirewallExecutor(AgentExecutor):
             WRITE_ACTIONS = {"block", "unblock", "qos_set"}
             if action in WRITE_ACTIONS and not deploy:
                 # 計画フェーズ: Go API には書き込まず、実行プランだけ返す
-                ip    = classified.get("ip", "?")
-                proto = classified.get("proto", "?")
-                port  = classified.get("port", "?")
-                limit = classified.get("limit", "?")
+                ip    = classified.get("ip")
+                proto = classified.get("proto")
+                port  = classified.get("port")
+                limit = classified.get("limit")
+
+                # ★ block/unblock: proto・port が不足している場合は案内メッセージを返す
+                if action in ("block", "unblock"):
+                    missing_proto = not proto or str(proto).lower() in ("none", "?", "")
+                    missing_port  = not port  or str(port).lower()  in ("none", "?", "")
+                    if missing_proto and missing_port:
+                        hint_msg = get_msg("xdp_need_proto_port")
+                    elif missing_proto:
+                        hint_msg = get_msg("xdp_need_proto")
+                    elif missing_port:
+                        hint_msg = get_msg("xdp_need_port")
+                    else:
+                        hint_msg = None
+
+                    if hint_msg:
+                        result = {
+                            "status":  "need_input",
+                            "action":  action,
+                            "deploy":  False,
+                            "message": hint_msg,
+                            "query":   query,
+                        }
+                        logger.info(f"パラメータ不足: ip={ip} proto={proto} port={port}")
+                        await event_queue.enqueue_event(
+                            new_agent_text_message(
+                                json.dumps(result, ensure_ascii=True, indent=2)))
+                        return
+
+                # 表示用に None / 未指定を "?" に変換
+                ip_d    = ip    or "?"
+                proto_d = proto or "?"
+                port_d  = port  or "?"
+                limit_d = limit or "?"
+
                 if action == "block":
-                    plan_msg = get_msg("xdp_block_plan", ip=ip, port=port, proto=proto)
+                    plan_msg = get_msg("xdp_block_plan", ip=ip_d, port=port_d, proto=proto_d)
                 elif action == "unblock":
-                    plan_msg = get_msg("xdp_unblock_plan", ip=ip, port=port, proto=proto)
+                    plan_msg = get_msg("xdp_unblock_plan", ip=ip_d, port=port_d, proto=proto_d)
                 else:
-                    plan_msg = get_msg("xdp_qos_plan", ip=ip, limit=limit)
+                    plan_msg = get_msg("xdp_qos_plan", ip=ip_d, limit=limit_d)
+
+                # ★ exec_tags を生成して result に含める（2026-05-21 修正）
+                # 計画フェーズでも承認ボタンを表示するため、
+                # classified の内容から exec_tags を構築して返す。
+                # app_a2a.py の既存の sticky footer ロジック（render_chat_sticky）が
+                # exec_tags を検出して承認ボタンを表示する。
+                _plan_exec_tags = []
+                if action == "block" and ip and proto and port:
+                    _plan_exec_tags = [{
+                        "path":   "/drop/block",
+                        "params": {"ip": ip, "proto": proto, "port": str(port)},
+                    }]
+                elif action == "unblock" and ip and proto and port:
+                    _plan_exec_tags = [{
+                        "path":   "/drop/unblock",
+                        "params": {"ip": ip, "proto": proto, "port": str(port)},
+                    }]
+                elif action == "qos_set" and ip and limit:
+                    _plan_exec_tags = [{
+                        "path":   "/qos/set",
+                        "params": {"ip": ip, "limit": str(limit)},
+                    }]
 
                 result = {
                     "status":     "plan",
@@ -673,9 +729,10 @@ class XdpFirewallExecutor(AgentExecutor):
                     "deploy":     False,
                     "message":    plan_msg,
                     "classified": classified,
+                    "exec_tags":  _plan_exec_tags,   # ★ 承認ボタン用
                     "query":      query,
                 }
-                logger.info(f"計画フェーズ: {plan_msg}")
+                logger.info(f"計画フェーズ: {plan_msg} exec_tags={_plan_exec_tags}")
             else:
                 # 実行フェーズ (読み取り系は deploy 不問、書き込み系は deploy=True のみ)
                 result = self._execute_action(classified)

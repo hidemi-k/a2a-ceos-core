@@ -204,13 +204,24 @@ def classify_query(query: str) -> str:
         return "verify"
 
     # 2. XDP/FW 明示キーワードがあれば security 確定
-    #    ★ ただし READ_OVERRIDE_WORDS + READ動詞がある場合は read を優先（方針B）
+    #    ★ READ_OVERRIDE_WORDS + READ動詞がある場合は read を優先（方針B）
     #    例: "BGPのACLを確認して" → acl がヒットするが "確認" もある → read
     #    例: "10.0.1.30をブロックして" → ブロックがヒット、READ_OVERRIDE にない → security
+    #
+    #    ★ ただし XDP固有ワード（xdp/ebpf/firewall）が含まれる場合は
+    #       READ_OVERRIDE を無効にする（2026-05-21 修正）
+    #    例: "XDPでQoSの設定を確認して"
+    #       → xdp（SECURITY_REQUIRED）+ qos（READ_OVERRIDE）+ 確認（READ）
+    #       → xdp が明示されているので override 無効 → security
+    #    例: "QoSの設定を確認して"
+    #       → qos（READ_OVERRIDE）+ 確認（READ）、xdp なし → override 有効 → read
+    _XDP_EXPLICIT = ["xdp", "ebpf", "firewall", "ファイアウォール"]
     if any(k in q for k in SECURITY_REQUIRED):
+        has_xdp_explicit = any(k in q for k in _XDP_EXPLICIT)
         override = any(k in q for k in READ_OVERRIDE_WORDS)
         has_read_verb = any(k in q for k in READ_KEYWORDS)
-        if override and has_read_verb:
+        # XDP固有ワードが明示されている場合は override を無効化
+        if override and has_read_verb and not has_xdp_explicit:
             return "read"
         return "security"
 

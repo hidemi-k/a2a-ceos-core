@@ -172,12 +172,17 @@ EAPI_READ_TEMPLATE = """
 - 理由: 社内は Cisco 機器ベースのため Cisco 互換形式（show ip bgp 系）に統一する
 - BGP アクセスリスト確認: "show bgp access-list" を使用すること
   ※ "show ip bgp access-list" は Arista EOS で "% Incomplete command" になるため使用禁止
+- IP アクセスリスト確認: "show ip access-lists" を使用すること（末尾に s が必要）
+  ※ "show ip access-list"（s なし）は Arista EOS で "Incomplete token" になるため使用禁止
+  ※ 特定 ACL 名を指定: "show ip access-lists <ACL名>" の形式を使用すること
 
 【インターフェース・トラフィックコマンドの制約】
 - インターフェース状態確認（up/down, description）: "show interfaces" を使用すること
 - トラフィック・カウンター確認（送受信パケット数, バイト数）: "show interfaces counters" を使用すること
 - インターフェース一覧・IP アドレス確認: "show ip interface brief" を使用すること
 - 「トラフィック」「カウンター」「パケット数」「送受信」というキーワードは "show interfaces counters" を優先すること
+- QoS 設定確認: "show qos interfaces" および "show qos maps" を使用すること
+  ※ "show qos scheduling hierarchy" は Arista cEOS で "not supported on this hardware platform" になるため使用禁止
 - 特定インターフェースの description 確認: "show interfaces Ethernet1" を使用すること
   ※ "show interfaces description Ethernet1" は Arista EOS で無効（Invalid input）のため使用禁止
   ※ "show interfaces description" は全インターフェース一覧のみ有効（引数なし）
@@ -206,6 +211,18 @@ EAPI_READ_TEMPLATE = """
 _FORBIDDEN_PREFIXES = [
     "configure", "interface", "ip ", "no ", "shutdown",
     "vlan ", "router ", "enable",
+]
+
+# cEOS で実行不可なコマンド（完全一致・前方一致）
+# LLM が誤生成した場合にコマンドリストから除外する
+_CEOS_UNAVAILABLE_CMDS = [
+    # Arista cEOS ではハードウェア非対応
+    "show qos scheduling hierarchy",  # Unavailable command (not supported on this hardware platform)
+    # Arista cEOS では Incomplete command になるもの
+    "show lacp neighbor",
+    "show port-channel summary",
+    "show logging last",
+    "show mpls",
 ]
 
 
@@ -1273,8 +1290,31 @@ class AristaEapiShowExecutor(AgentExecutor):
                         # 引数なし（全IF一覧）はそのまま
                         normalized_cmds.append(cmd)
 
+                # show ip access-list → show ip access-lists
+                # Arista EOS では末尾の s が必須。
+                # "show ip access-list" は "Incomplete token (at token 2: 'access-list')"
+                # になるため正規化する。引数（ACL名）がある場合も末尾 s に統一する。
+                elif c == "show ip access-list" or c.startswith("show ip access-list "):
+                    # "show ip access-list" → "show ip access-lists"
+                    # "show ip access-list <NAME>" → "show ip access-lists <NAME>"
+                    _suffix = cmd.strip()[len("show ip access-list"):].strip()
+                    _normalized = f"show ip access-lists {_suffix}".strip()
+                    logger.info(f"コマンド正規化: '{cmd}' → '{_normalized}'")
+                    normalized_cmds.append(_normalized)
+
+                # cEOS 非対応コマンドはリストから除外（エラーで全コマンドが失敗するのを防ぐ）
+                elif any(c == unavail.lower() or c.startswith(unavail.lower())
+                         for unavail in _CEOS_UNAVAILABLE_CMDS):
+                    logger.warning(f"cEOS非対応コマンドを除外: '{cmd}'")
+                    # 除外するだけ（normalized_cmds に追加しない）
+
                 else:
                     normalized_cmds.append(cmd)
+
+            # 除外後にコマンドが空になった場合のフォールバック
+            if not normalized_cmds:
+                logger.warning("正規化後にコマンドが空になりました。元のコマンドリストを使用します。")
+                normalized_cmds = list(cmds)
             cmds = normalized_cmds
 
             logger.info(f"実行コマンド: {cmds}")
