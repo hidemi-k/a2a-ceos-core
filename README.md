@@ -162,8 +162,8 @@ Natural language query
 ### Install
 
 ```bash
-git clone https://github.com/hidemi-k/maf-a2a-ceos.git
-cd maf-a2a-ceos
+git clone https://github.com/hidemi-k/a2a-ceos-core.git
+cd a2a-ceos-core
 pip install -r requirements.txt
 ```
 
@@ -233,7 +233,7 @@ After comparing CLI, eAPI, pyeapi, NETCONF, and RESTCONF as the configuration in
 | Pre-diff | None | None | **✅ Reproduced via `configure session`** |
 | Multi-vendor expansion | ❌ | ❌ Arista-only | **✅ Easy Juniper/Cisco extension** |
 
-eAPI is an Arista-proprietary API, making multi-vendor deployment difficult. NETCONF is a standard protocol, so extending to Juniper/Cisco requires only swapping the RAG template layer (FAISS index). YANG-schema-based XML also gives LLMs higher generation accuracy than fragmented CLI commands, and `edit-config` idempotency automatically skips duplicate configuration.
+eAPI is an Arista-proprietary API, making multi-vendor deployment difficult. NETCONF is a standard protocol, so future Juniper support will be added as microservices such as `a2a-junos-read` and `a2a-junos-write`. The A2A Hub can incorporate new agents into the existing flow simply by updating the routing logic. YANG-schema-based XML also gives LLMs higher generation accuracy than fragmented CLI commands, and `edit-config` idempotency automatically skips duplicate configuration.
 
 ---
 

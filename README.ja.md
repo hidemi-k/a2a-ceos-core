@@ -161,8 +161,8 @@
 ### インストール
 
 ```bash
-git clone https://github.com/hidemi-k/maf-a2a-ceos.git
-cd maf-a2a-ceos
+git clone https://github.com/hidemi-k/a2a-ceos-core.git
+cd a2a-ceos-core
 pip install -r requirements.txt
 ```
 
@@ -231,7 +231,7 @@ Azure VM (172.20.100.0/24 — clab-mgmt)
 | 事前 diff | なし | なし | **✅ configure session で再現** |
 | マルチベンダー展開 | ❌ | ❌ Arista 専用 | **✅ Juniper/Cisco 対応が容易** |
 
-eAPI は Arista 専用 API のためマルチベンダー展開が困難ですが、NETCONF は標準プロトコルのため Juniper/Cisco への拡張が容易です。また YANG スキーマに基づく XML は断片的な CLI コマンドより LLM の生成精度が高く、`edit-config` の冪等性により重複設定を自動スキップできます。将来の Juniper/Cisco 対応は RAG のテンプレート層（FAISS インデックス）を差し替えるだけで済みます。
+eAPI は Arista 専用 API のためマルチベンダー展開が困難ですが、NETCONF は標準プロトコルのため Juniper/Cisco への拡張が容易です。また YANG スキーマに基づく XML は断片的な CLI コマンドより LLM の生成精度が高く、`edit-config` の冪等性により重複設定を自動スキップできます。将来の Juniper 対応は、`a2a-junos-read`・`a2a-junos-write` のように必要な機能だけをマイクロサービスとして追加する方針で進めます。A2A Hub のルーティングロジックを変えるだけで、新しいエージェントを既存フローに組み込めます。
 
 ---
 
