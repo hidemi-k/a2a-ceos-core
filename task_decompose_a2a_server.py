@@ -81,12 +81,13 @@ A2A_HOST       = os.getenv("A2A_HOST",       "0.0.0.0")
 A2A_PORT       = int(os.getenv("A2A_PORT",   "8000"))
 A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 
-NETCONF_A2A_URL = os.getenv("NETCONF_A2A_URL", "http://localhost:8001")
-EAPI_A2A_URL    = os.getenv("EAPI_A2A_URL",    "http://localhost:8002")
-EAPI_SDIFF_URL  = os.getenv("EAPI_SDIFF_URL",  "http://localhost:8009")  # session-diff REST
-XDP_A2A_URL     = os.getenv("XDP_A2A_URL",     "http://localhost:8003")
-ANTA_A2A_URL    = os.getenv("ANTA_A2A_URL",    "http://localhost:8004")  # ANTA Snapshot 検証
-HTTP_TIMEOUT    = float(os.getenv("HTTP_TIMEOUT", "120"))
+NETCONF_A2A_URL    = os.getenv("NETCONF_A2A_URL",    "http://localhost:8001")
+EAPI_A2A_URL       = os.getenv("EAPI_A2A_URL",       "http://localhost:8002")
+EAPI_SDIFF_URL     = os.getenv("EAPI_SDIFF_URL",     "http://localhost:8009")  # session-diff REST
+XDP_A2A_URL        = os.getenv("XDP_A2A_URL",        "http://localhost:8003")
+ANTA_A2A_URL       = os.getenv("ANTA_A2A_URL",       "http://localhost:8004")  # ANTA Snapshot 検証
+EAPI_CONFIG_A2A_URL = os.getenv("EAPI_CONFIG_A2A_URL", "http://localhost:8006")  # eAPI configure session
+HTTP_TIMEOUT       = float(os.getenv("HTTP_TIMEOUT", "120"))
 
 
 # LLM インスタンス（Groq Primary / Azure Fallback 自動切り替え）
@@ -187,10 +188,11 @@ VERIFY_KEYWORDS = [
 
 def classify_query(query: str) -> str:
     """
-    クエリを verify / security / write / read の4種に分類する。
+    クエリを eapi_config / verify / security / write / read の5種に分類する。
 
     判定ロジック:
-      1. VERIFY_KEYWORDS   → verify （ANTA検証は最優先）
+      0. VXLAN/EVPN × 設定変更 → eapi_config（NETCONF非対応のため最優先）
+      1. VERIFY_KEYWORDS   → verify （ANTA検証）
       2. SECURITY_REQUIRED → security（XDP/FW操作の明示キーワード）
       3. READ + SECURITY_CONTEXT の両方 → read を優先
          （例: "フローの状態を確認" → read, "フローをブロック" → security）
@@ -198,6 +200,20 @@ def classify_query(query: str) -> str:
       5. いずれも該当しない → LLMフォールバック（改善プロンプト）
     """
     q = query.lower()
+
+    # 0. VXLAN/EVPN × 設定変更 → eapi_config（最優先）
+    #    NETCONF/OpenConfig では設定不可のため eAPI configure session で処理する
+    _has_vxlan_evpn = any(k in q for k in [
+        "vxlan", "evpn", "vni", "vtep", "route-target",
+        "ルートターゲット", "mac flooding", "mac フラッディング",
+        "address-family evpn", "evpn アドレスファミリー",
+    ])
+    _has_write_verb = any(k in q for k in [
+        "設定", "変更", "追加", "適用", "投入", "作成", "修正",
+        "configure", "set", "add", "update", "apply", "create",
+    ])
+    if _has_vxlan_evpn and _has_write_verb:
+        return "eapi_config"
 
     # 1. ANTA 検証を最優先
     if any(k in q for k in VERIFY_KEYWORDS):
@@ -259,12 +275,15 @@ def classify_query(query: str) -> str:
     result = invoke_with_fallback(
         llm,
         "あなたは Arista ネットワーク管理システムのルーター AI です。\n"
-        "以下のクエリを 4 種類のルートのうち 1 つに分類し、一単語のみで回答してください。\n\n"
+        "以下のクエリを 5 種類のルートのうち 1 つに分類し、一単語のみで回答してください。\n\n"
         "【ルート定義】\n"
+        "  eapi_config : VXLAN/EVPN の設定変更（NETCONF/OpenConfig 非対応）\n"
+        "                例: VXLAN VNI 設定 / EVPN RD/RT 設定 / VTEP 設定 /\n"
+        "                    address-family evpn 有効化 / MAC フラッディング追加\n"
         "  read     : Arista cEOS デバイスの状態参照（show コマンド相当）\n"
         "             例: BGP 状態確認 / インターフェース確認 / ACL 表示 /\n"
         "                 ルーティングテーブル / NTP 状態 / VLAN 一覧\n"
-        "  write    : Arista cEOS デバイスへの設定変更\n"
+        "  write    : Arista cEOS デバイスへの設定変更（VXLAN/EVPN 以外）\n"
         "             例: VLAN 作成 / インターフェース設定 / BGP neighbor 追加\n"
         "  security : XDP/eBPF ファイアウォールに関するあらゆる操作・参照・分析\n"
         "             例: IP ブロック / 遮断 / QoS 帯域制限 / フロー統計参照 /\n"
@@ -273,18 +292,20 @@ def classify_query(query: str) -> str:
         "  verify   : ANTA によるネットワーク検証・スナップショット\n"
         "             例: 事後検証 / post-check / anta テスト / 副作用確認\n\n"
         "【判定ルール（重要）】\n"
+        "  - 「VXLAN」「EVPN」「VNI」「VTEP」「route-target」+「設定/変更/追加」→ eapi_config\n"
         "  - 「セキュリティ」+「統計/監視/アラート/分析/フロー」→ security\n"
         "  - 「セキュリティポリシー」「ACL」「FW ルール」等デバイス設定の参照 → read\n"
         "  - 「ブロック」「遮断」「xdp」「ebpf」単独 → security\n"
         "  - 「show」で始まる CLI コマンド → read\n"
         "  - NTP / BGP / OSPF / インターフェース / ルート の参照 → read\n\n"
         f"クエリ: {query}\n"
-        "回答（read / write / security / verify のいずれか一単語のみ）:"
+        "回答（eapi_config / read / write / security / verify のいずれか一単語のみ）:"
     ).strip().lower()
 
-    if "write"    in result: return "write"
-    if "security" in result: return "security"
-    if "verify"   in result: return "verify"
+    if "eapi_config" in result: return "eapi_config"
+    if "write"       in result: return "write"
+    if "security"    in result: return "security"
+    if "verify"      in result: return "verify"
     return "read"
 
 
@@ -483,7 +504,8 @@ async def healthz():
         for name, url in [("netconf", NETCONF_A2A_URL),
                             ("eapi",    EAPI_A2A_URL),
                             ("xdp",     XDP_A2A_URL),
-                            ("anta",    ANTA_A2A_URL)]:
+                            ("anta",    ANTA_A2A_URL),
+                            ("eapi_config", EAPI_CONFIG_A2A_URL)]:
             try:
                 r = await client.get(f"{url}/.well-known/agent.json")
                 servers[name] = {"status": "ok", "name": r.json().get("name")}
@@ -497,10 +519,11 @@ async def healthz():
         "hub_port":   A2A_PORT,
         "downstream": servers,
         "routes": {
-            "write":    NETCONF_A2A_URL,
-            "read":     EAPI_A2A_URL,
-            "security": XDP_A2A_URL,
-            "verify":   ANTA_A2A_URL,
+            "write":       NETCONF_A2A_URL,
+            "read":        EAPI_A2A_URL,
+            "security":    XDP_A2A_URL,
+            "verify":      ANTA_A2A_URL,
+            "eapi_config": EAPI_CONFIG_A2A_URL,
         },
     }
 
@@ -594,6 +617,85 @@ async def execute(req: ExecuteRequest):
         }
         from fastapi.responses import Response
         return Response(
+            content=json.dumps(response, ensure_ascii=True),
+            media_type="application/json",
+        )
+
+    # ── eapi_config ルート: VXLAN/EVPN 設定変更 (8006) dry-run ─────────────────
+    if route == "eapi_config":
+        eapi_cfg_payload = {
+            "query":  req.query,
+            "deploy": False,   # dry-run（Phase1）
+        }
+        try:
+            eapi_cfg_result = await _forward(EAPI_CONFIG_A2A_URL, eapi_cfg_payload)
+        except httpx.ConnectError as e:
+            raise HTTPException(status_code=503,
+                detail=f"eAPI Config Server ({EAPI_CONFIG_A2A_URL}) に接続できません: {e}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # eAPI config の diff を diff_history 互換の session_diff 形式に変換する
+        raw_diff = eapi_cfg_result.get("diff", "")
+        diff_lines = []
+        for line in raw_diff.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                diff_lines.append({"op": "+", "text": line[1:].lstrip()})
+            elif line.startswith("-") and not line.startswith("---"):
+                diff_lines.append({"op": "-", "text": line[1:].lstrip()})
+            elif line.startswith("@@"):
+                diff_lines.append({"op": "@@", "text": line})
+
+        session_diff = {
+            "status":     "ok" if raw_diff else "no_change",
+            "diff_lines": diff_lines,
+            "diff_text":  raw_diff,
+            "message":    eapi_cfg_result.get("message", ""),
+        }
+        # AI 要約（LLMによるdiff解釈）を生成する
+        if raw_diff:
+            try:
+                ai_summary = invoke_with_fallback(
+                    llm,
+                    "以下は Arista cEOS の設定変更差分（configure session diffs）です。\n"
+                    "この差分を日本語で2〜3文に要約してください。\n"
+                    "変更の意図と影響を具体的に述べてください。\n\n"
+                    f"差分:\n{raw_diff[:1500]}\n\n要約:"
+                ).strip()
+                session_diff["ai_summary"] = ai_summary
+            except Exception:
+                session_diff["ai_summary"] = ""
+
+        cmds = eapi_cfg_result.get("cmds", [])
+        status = eapi_cfg_result.get("status", "unknown")
+
+        response = {
+            "trace_id":     trace_id,
+            "route":        "eapi_config",
+            "is_read":      False,
+            "status":       status,   # "plan" | "blocked" | "error"
+            "summary":      (
+                f"eAPI Config dry-run: {len(cmds)}件のコマンドを計画しました"
+                if status == "plan" else eapi_cfg_result.get("message", "")
+            ),
+            "xml":          "",       # NETCONF XML は不要
+            "session_diff": session_diff,
+            "routed_to":    EAPI_CONFIG_A2A_URL,
+            "result":       eapi_cfg_result,
+            # eapi_config 専用フィールド（UI が参照）
+            "eapi_cmds":    cmds,
+            "eapi_diff":    raw_diff,
+            "eapi_session": eapi_cfg_result.get("session", ""),
+            "eapi_warning": eapi_cfg_result.get("warning", ""),
+        }
+        _trace_store[trace_id] = {
+            **response,
+            "device":      req.device.model_dump(),
+            "query":       req.query,
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        from fastapi.responses import Response as _ECResp
+        return _ECResp(
             content=json.dumps(response, ensure_ascii=True),
             media_type="application/json",
         )
@@ -877,6 +979,59 @@ async def deploy(trace_id: str, req: DeployRequest):
         "port":      req.device.port,
         "deploy":    True,
     }
+
+
+    # ── eapi_config ルート: eAPI configure session commit (8006) ─────────────
+    if stored.get("route") == "eapi_config":
+        # Phase1 で生成した CLI コマンドを Phase2 で再利用（LLM 再呼び出し不要）
+        stored_cmds = stored.get("eapi_cmds", [])
+        eapi_cfg_deploy_payload = {
+            "query":  query,
+            "deploy": True,
+            "cmds":   stored_cmds,  # Phase1 生成済みコマンドを指定
+        }
+        try:
+            eapi_cfg_result = await _forward(EAPI_CONFIG_A2A_URL, eapi_cfg_deploy_payload)
+        except httpx.ConnectError as e:
+            logger.error(f"[{trace_id}] eAPI Config deploy エラー: {e}")
+            await _push_log(trace_id, f"eAPI Config deploy 失敗: {e}")
+            raise HTTPException(status_code=503,
+                detail=f"eAPI Config Server ({EAPI_CONFIG_A2A_URL}) に接続できません: {e}")
+        except Exception as e:
+            logger.error(f"[{trace_id}] eAPI Config deploy エラー: {e}")
+            await _push_log(trace_id, get_msg("deploy_failed") + f": {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        status = eapi_cfg_result.get("status", "unknown")
+        response = {
+            "trace_id":   trace_id,
+            "route":      "eapi_config",
+            "status":     status,
+            "summary":    eapi_cfg_result.get("message", ""),
+            "result":     eapi_cfg_result,
+            "eapi_cmds":  eapi_cfg_result.get("cmds", stored_cmds),
+            "eapi_session": eapi_cfg_result.get("session", ""),
+            "audit_scope_note": "eAPI configure session commit — running-config に反映済み",
+            "task_summaries": [
+                {
+                    "task_id":       "eapi_config",
+                    "operation":     "eapi_configure_session",
+                    "target":        "running-config",
+                    "deploy_status": "success" if status == "success" else status,
+                    "audit_message": eapi_cfg_result.get("message", "")[:120],
+                    "audit_scope":   f"cmds: {stored_cmds}",
+                }
+            ],
+        }
+        _trace_store[trace_id]["deploy_result"] = response
+        _trace_store[trace_id]["deployed_at"]   = datetime.now(timezone.utc).isoformat()
+        await _push_log(trace_id, f"eAPI Config commit 完了: {status}")
+        logger.info(f"[{trace_id}] eAPI Config /deploy 完了: status={status}")
+        from fastapi.responses import Response as _ECFR
+        return _ECFR(
+            content=json.dumps(response, ensure_ascii=True),
+            media_type="application/json",
+        )
 
     # ── security ルートは XDP A2A (8003) へ deploy=True で再送 ────────────────
     if stored.get("route") == "security":
@@ -1270,11 +1425,12 @@ def main():
     logger.info(f"  REST /execute      : {A2A_PUBLIC_URL}/execute")
     logger.info(f"  REST /anta/snapshot: {A2A_PUBLIC_URL}/anta/snapshot")
     logger.info(f"  REST /anta/post_check: {A2A_PUBLIC_URL}/anta/post_check")
-    logger.info(f"  NETCONF A2A (write): {NETCONF_A2A_URL}")
-    logger.info(f"  eAPI A2A    (read) : {EAPI_A2A_URL}")
-    logger.info(f"  XDP A2A  (security): {XDP_A2A_URL}")
-    logger.info(f"  ANTA A2A  (verify) : {ANTA_A2A_URL}  ← NEW")
-    logger.info(f"  Routes: write→8001 / read→8002 / security→8003 / verify→8004")
+    logger.info(f"  NETCONF A2A (write)     : {NETCONF_A2A_URL}")
+    logger.info(f"  eAPI A2A    (read)      : {EAPI_A2A_URL}")
+    logger.info(f"  XDP A2A  (security)     : {XDP_A2A_URL}")
+    logger.info(f"  ANTA A2A  (verify)      : {ANTA_A2A_URL}  ← NEW")
+    logger.info(f"  eAPI Config (eapi_config): {EAPI_CONFIG_A2A_URL}  ← NEW")
+    logger.info(f"  Routes: write→8001 / read→8002 / security→8003 / verify→8004 / eapi_config→8006")
     log_llm_config("Hub")
     logger.info("=" * 64)
 

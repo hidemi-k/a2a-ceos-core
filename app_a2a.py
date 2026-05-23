@@ -127,6 +127,20 @@ _UI_MSG = {
         "cnv_error":           "⚠️ 自動 Post-Check 失敗",
         "cnv_label":           "自動 Post-Check",
         "cnv_new_issues":      "新規 failure（変更の副作用）",
+        # ── eAPI Config タブ ─────────────────────────────────────────────────
+        "eapi_cfg_tab_title":  "eAPI Config — VXLAN/EVPN",
+        "eapi_cfg_hint":       "NETCONF 非対応の VXLAN/EVPN 設定を eAPI configure session で変更します",
+        "eapi_cfg_input_hint": "例: VXLAN VNI 100 に vni 10000 を設定して",
+        "eapi_cfg_dry_run":    "Dry-run（差分確認）",
+        "eapi_cfg_commit":     "✓ 承認 & Commit",
+        "eapi_cfg_running":    "⟳ eAPI Config 実行中...",
+        "eapi_cfg_plan":       "設定計画（Dry-run 完了）",
+        "eapi_cfg_success":    "✅ Commit 完了",
+        "eapi_cfg_blocked":    "🚫 安全ガードによりブロック",
+        "eapi_cfg_no_diff":    "（差分なし — 既に設定済みか、コマンドが無効の可能性）",
+        "eapi_cfg_history":    "変更履歴",
+        "eapi_cfg_cmds":       "実行コマンド",
+        "eapi_cfg_warning":    "⚠️ High Risk",
     },
     "en": {
         "send": "Send", "approve_deploy": "Approve & Deploy",
@@ -201,6 +215,20 @@ _UI_MSG = {
         "cnv_error":           "⚠️ Auto Post-Check failed",
         "cnv_label":           "Auto Post-Check",
         "cnv_new_issues":      "New failures (side-effects of change)",
+        # ── eAPI Config tab ─────────────────────────────────────────────────
+        "eapi_cfg_tab_title":  "eAPI Config — VXLAN/EVPN",
+        "eapi_cfg_hint":       "Configure VXLAN/EVPN via eAPI configure session (NETCONF unsupported)",
+        "eapi_cfg_input_hint": "e.g. Set VXLAN VNI 100 to vni 10000",
+        "eapi_cfg_dry_run":    "Dry-run (preview diff)",
+        "eapi_cfg_commit":     "✓ Approve & Commit",
+        "eapi_cfg_running":    "⟳ eAPI Config running...",
+        "eapi_cfg_plan":       "Config plan (Dry-run done)",
+        "eapi_cfg_success":    "✅ Commit complete",
+        "eapi_cfg_blocked":    "🚫 Blocked by safety guard",
+        "eapi_cfg_no_diff":    "(No diff — already configured or invalid command)",
+        "eapi_cfg_history":    "Change history",
+        "eapi_cfg_cmds":       "Commands",
+        "eapi_cfg_warning":    "⚠️ High Risk",
     },
 }
 
@@ -220,7 +248,9 @@ API_BASE    = os.getenv("API_BASE",    "http://localhost:8000")
 WS_BASE     = os.getenv("WS_BASE",     "ws://localhost:8000")
 XDP_URL     = os.getenv("XDP_URL",     "http://localhost:8003")  # XDP A2A Server
 XDP_API_URL = os.getenv("XDP_API_URL", "http://localhost:8080")  # Go IPS Server
-ANTA_URL    = os.getenv("ANTA_URL",    "http://localhost:8004")  # ANTA Verify A2A Server
+ANTA_URL      = os.getenv("ANTA_URL",      "http://localhost:8004")  # ANTA Verify A2A Server
+DIAGNOSE_URL      = os.getenv("DIAGNOSE_URL",      "http://localhost:8005")  # Diagnose A2A Server
+EAPI_CONFIG_URL   = os.getenv("EAPI_CONFIG_URL",   "http://localhost:8000")  # Hub 経由（Hub が 8006 へ転送）
 
 DEVICE = {
     "ip":       os.getenv("DEVICE_IP",   "172.20.100.31"),
@@ -658,9 +688,10 @@ def _parse_execute_result(result: dict) -> dict:
       result["xml"] == "" でも overall_status == "dry_run" かつ
       task_summaries が存在すれば dry-run 成功 → 承認待ちへ遷移する。
     """
-    is_read     = result.get("is_read", False)
-    is_security = result.get("route", "") == "security"
-    is_verify   = result.get("route", "") == "verify"   # ANTA 事後検証ルート
+    is_read        = result.get("is_read", False)
+    is_security    = result.get("route", "") == "security"
+    is_verify      = result.get("route", "") == "verify"   # ANTA 事後検証ルート
+    is_eapi_config = result.get("route", "") == "eapi_config"  # VXLAN/EVPN eAPI設定変更
     # Hub は result.get("status") or result.get("overall_status") で設定する
     status  = result.get("status", "unknown")
     summary = result.get("summary", "")
@@ -668,6 +699,43 @@ def _parse_execute_result(result: dict) -> dict:
 
     # [修正1核心] バックエンドのレスポンスは result["result"] にネストされている
     inner = result.get("result", {}) or {}
+
+    # ── eAPI Config (VXLAN/EVPN): 設定変更結果を Chat に表示 ─────────────────
+    if is_eapi_config:
+        cmds      = result.get("eapi_cmds", inner.get("cmds", []))
+        diff_text = result.get("eapi_diff", inner.get("diff", ""))
+        warning   = result.get("eapi_warning", inner.get("warning", ""))
+        sd        = result.get("session_diff", {}) or {}
+        ai_sum    = sd.get("ai_summary", "")
+        # diff 行数サマリー
+        adds = sum(1 for l in diff_text.splitlines()
+                   if l.startswith("+") and not l.startswith("+++"))
+        dels = sum(1 for l in diff_text.splitlines()
+                   if l.startswith("-") and not l.startswith("---"))
+        diff_brief = (f"+{adds} / -{dels} 行" if diff_text else "差分なし")
+        return {
+            "is_read":         False,
+            "is_security":     False,
+            "is_verify":       False,
+            "is_eapi_config":  True,
+            "is_dry_run":      (status == "plan"),
+            "status":          status,
+            "summary":         summary or f"eAPI Config dry-run: {len(cmds)}件のコマンドを計画",
+            "cmds":            [],
+            "formatted":       "",
+            "xml":             "",
+            "tasks":           [],
+            "task_summaries":  [],
+            "diff":            diff_text,
+            "session_diff":    sd,
+            "logs":            [],
+            # eapi_config 専用フィールド
+            "eapi_cmds":       cmds,
+            "eapi_diff":       diff_text,
+            "eapi_diff_brief": diff_brief,
+            "eapi_warning":    warning,
+            "eapi_ai_summary": ai_sum,
+        }
 
     # ── Verify 系 (ANTA A2A): 事後検証結果を Chat に表示 ──────────────────────
     if is_verify:
@@ -1393,6 +1461,9 @@ def main():
                 tab_verify   = ui.tab("Verify",          icon="verified").style(
                     f"color:{C['info_fg']};"
                 )
+                tab_diagnose = ui.tab("Diagnose",        icon="troubleshoot").style(
+                    f"color:{C['warn_fg']};"
+                )
                 tab_security = ui.tab("Security",        icon="security").style(
                     f"color:{C['danger_fg']};"
                 )
@@ -1617,16 +1688,18 @@ def main():
                             state.pending_query = query
                             trace_label.text    = f"trace: {state.trace_id}"
 
-                            is_read     = p["is_read"]
-                            is_security = p.get("is_security", False)
-                            is_verify   = p.get("is_verify",   False)   # ANTA 事後検証
-                            is_mixed    = p.get("is_mixed",    False)   # 混合クエリ
-                            is_dry_run  = p["is_dry_run"]   # ★ dry_run フラグ
-                            status      = p["status"]
-                            summary     = p["summary"]
+                            is_read        = p["is_read"]
+                            is_security    = p.get("is_security",    False)
+                            is_verify      = p.get("is_verify",      False)
+                            is_mixed       = p.get("is_mixed",       False)
+                            is_eapi_config = p.get("is_eapi_config", False)  # VXLAN/EVPN
+                            is_dry_run     = p["is_dry_run"]
+                            status         = p["status"]
+                            summary        = p["summary"]
 
-                            # 差分履歴に追加（WRITE系のみ。Security/READ/Verify系は除外）
-                            if not is_read and not is_security and not is_verify and state.trace_id:
+                            # 差分履歴に追加（WRITE系のみ。Security/READ/Verify/eapi_config は除外）
+                            # eapi_config は Chat バブル承認後の commit 時に追加する
+                            if not is_read and not is_security and not is_verify and not is_eapi_config and state.trace_id:
                                 state.diff_history.append({
                                     "trace_id":       state.trace_id,
                                     "query":          query,
@@ -1652,6 +1725,7 @@ def main():
                             if (not is_read
                                     and not is_security
                                     and not is_verify      # ← Verify は承認フロー不要
+                                    and not is_eapi_config # ← eAPI Config は専用フローで処理
                                     and dry_run_chk.value
                                     and (is_dry_run or has_tasks)):
 
@@ -1746,6 +1820,52 @@ def main():
                                     on_edit=_on_edit,
                                 )
                                 switch_to_diff()
+
+                            # ── eAPI Config 系: VXLAN/EVPN 差分を Chat に表示 ──
+                            elif is_eapi_config:
+                                _ec_status  = status   # "plan" | "blocked" | "error"
+                                _ec_cmds    = p.get("eapi_cmds", [])
+                                _ec_diff    = p.get("eapi_diff", "")
+                                _ec_brief   = p.get("eapi_diff_brief", "差分なし")
+                                _ec_warn    = p.get("eapi_warning", "")
+                                _ec_ai      = p.get("eapi_ai_summary", "")
+                                _ec_tid     = raw.get("trace_id", "")
+                                _ec_sd      = p.get("session_diff", {}) or {}
+
+                                if _ec_status == "blocked":
+                                    render_agent_msg(
+                                        text=f"{L('eapi_cfg_blocked')}",
+                                        detail=summary,
+                                        status="failure",
+                                        chat_col=chat_col,
+                                    )
+                                    set_phase("idle")
+                                    asyncio.create_task(scroll_to_bottom())
+                                else:
+                                    # diff_history 互換エントリを作成して追加
+                                    _ec_entry = {
+                                        "trace_id":     _ec_tid,
+                                        "query":        query,
+                                        "route":        "eapi_config",
+                                        "eapi_cmds":    _ec_cmds,
+                                        "eapi_diff":    _ec_diff,
+                                        "eapi_warning": _ec_warn,
+                                        "session_diff": _ec_sd,
+                                        "diff":         _ec_diff,
+                                        "xml":          "",
+                                        "tasks":        [],
+                                        "task_summaries": [],
+                                        "status":       _ec_status,
+                                        "time":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                        "deployed":     False,
+                                        "is_read":      False,
+                                    }
+                                    state.diff_history.append(_ec_entry)
+                                    _eapi_cfg_pending[_ec_tid] = _ec_entry
+
+                                    set_phase("idle")
+                                    # Diff/History タブへ自動遷移（承認はそこで行う）
+                                    switch_to_diff()
 
                             # ── Verify 系: ANTA テスト結果を Chat に表示 ────
                             elif is_verify:
@@ -2372,6 +2492,7 @@ def main():
                     f"padding:0;height:100%;display:flex;flex-direction:column;width:100%;"
                     f"background:{C['bg']};"
                 ):
+                    # ── ヘッダー ─────────────────────────────────────────────
                     with ui.row().style(
                         f"padding:10px 16px;border-bottom:0.5px solid {C['border']};"
                         f"align-items:center;gap:10px;flex-shrink:0;background:{C['bg2']};"
@@ -2384,6 +2505,46 @@ def main():
                             f"font-size:11px;color:{C['text2']};"
                             f"border:0.5px solid {C['border2']};border-radius:5px;"
                         )
+
+                    # ── eAPI Config State（Diff/History スコープ）─────────────
+                    # state.diff_history に直接追加するため別リスト不要
+                    _eapi_cfg_pending: dict = {}   # trace_id → entry（承認待ち）
+                    _eapi_cfg_running = [False]    # 実行中フラグ
+
+                    # ── diff_history 互換の diff HTML 生成 ───────────────────
+                    def _eapi_diff_html(diff_text: str) -> str:
+                        if not diff_text:
+                            return (
+                                f'<div style="color:{C["text3"]};font-family:{C["mono"]};'
+                                f'font-size:11px;padding:8px;">{L("eapi_cfg_no_diff")}</div>'
+                            )
+                        lines = diff_text.strip().split("\n")
+                        out = [
+                            f'<div style="background:{C["bg3"]};'
+                            f'border:0.5px solid {C["border"]};'
+                            f'border-radius:6px;padding:10px;'
+                            f'font-family:{C["mono"]};font-size:11px;'
+                            f'overflow-x:auto;max-height:280px;overflow-y:auto;">'
+                        ]
+                        for ln in lines:
+                            if ln.startswith("+") and not ln.startswith("+++"):
+                                color, bg = C["success_fg"], C["success_bg"]
+                            elif ln.startswith("-") and not ln.startswith("---"):
+                                color, bg = C["danger_fg"], C["danger_bg"]
+                            elif ln.startswith("@@"):
+                                color, bg = C["info_fg"], C["info_bg"]
+                            else:
+                                color, bg = C["text2"], "transparent"
+                            esc = (ln.replace("&", "&amp;")
+                                     .replace("<", "&lt;")
+                                     .replace(">", "&gt;"))
+                            out.append(
+                                f'<div style="background:{bg};color:{color};'
+                                f'line-height:1.7;padding:1px 4px;'
+                                f'white-space:pre-wrap;">{esc}</div>'
+                            )
+                        out.append("</div>")
+                        return "\n".join(out)
 
                     diff_body = ui.column().style(
                         "flex:1;overflow-y:auto;padding:12px 16px;gap:12px;min-height:0;"
@@ -2399,6 +2560,144 @@ def main():
                                 )
                                 return
                             for entry in reversed(state.diff_history):
+                                # ── eAPI Config エントリ（route="eapi_config"）──────────
+                                if entry.get("route") == "eapi_config":
+                                    _ec_deployed = entry.get("deployed", False)
+                                    _ec_cmds     = entry.get("eapi_cmds", [])
+                                    _ec_diff     = entry.get("eapi_diff", "")
+                                    _ec_warn     = entry.get("eapi_warning", "")
+                                    _ec_tid      = entry.get("trace_id", "")
+                                    with ui.card().style(
+                                        f"background:{C['bg2']};"
+                                        f"border:0.5px solid {C['border2']};"
+                                        "border-radius:10px;padding:14px 16px;"
+                                        "gap:10px;box-shadow:none;width:100%;"
+                                    ):
+                                        # ヘッダー
+                                        with ui.row().style(
+                                            "align-items:center;gap:8px;flex-wrap:wrap;"
+                                            "padding-bottom:8px;"
+                                            f"border-bottom:0.5px solid {C['border']};"
+                                        ):
+                                            badge(
+                                                "deployed" if _ec_deployed else "dry-run",
+                                                "success"  if _ec_deployed else "dry-run",
+                                            )
+                                            badge("eAPI Config", "info")
+                                            ui.label(entry.get("query", "")).style(
+                                                f"font-size:13px;font-weight:500;color:{C['text']};"
+                                            )
+                                            ui.label("").style("flex:1;")
+                                            ui.label(entry.get("time", "")).style(
+                                                f"font-size:10px;color:{C['text3']};"
+                                            )
+                                            ui.label(entry.get("trace_id", "")).style(
+                                                f"font-size:10px;color:{C['text3']};"
+                                                f"font-family:{C['mono']};"
+                                            )
+
+                                        # コマンド一覧
+                                        if _ec_cmds:
+                                            ui.label(L("eapi_cfg_cmds")).style(
+                                                f"font-size:10px;font-weight:500;"
+                                                f"color:{C['text3']};"
+                                                "text-transform:uppercase;letter-spacing:.06em;"
+                                            )
+                                            ui.html(
+                                                f'<div style="background:{C["bg3"]};'
+                                                f'border-radius:6px;padding:8px 10px;'
+                                                f'font-family:{C["mono"]};font-size:11px;'
+                                                f'color:{C["success_fg"]};line-height:1.8;">'
+                                                + "<br>".join(
+                                                    f"  {c.replace('<','&lt;').replace('>','&gt;')}"
+                                                    for c in _ec_cmds
+                                                )
+                                                + "</div>"
+                                            )
+
+                                        # High Risk 警告
+                                        if _ec_warn:
+                                            ui.label(f"{L('eapi_cfg_warning')}: {_ec_warn}").style(
+                                                f"font-size:11px;color:{C['warn_fg']};"
+                                                f"padding:4px 8px;"
+                                                f"border-left:2px solid {C['warn_fg']};"
+                                            )
+
+                                        # ① 設定差分
+                                        ui.label("① 設定差分").style(
+                                            f"font-size:10px;font-weight:500;color:{C['text3']};"
+                                            "text-transform:uppercase;letter-spacing:.06em;"
+                                        )
+                                        ui.html(_eapi_diff_html(_ec_diff))
+
+                                        # AI 変更要約
+                                        _ec_ai = (entry.get("session_diff") or {}).get("ai_summary", "")
+                                        if _ec_ai:
+                                            ui.html(
+                                                f'<div style="margin-top:8px;padding:8px 10px;'
+                                                f'background:{C["bg3"]};'
+                                                f'border-left:3px solid {C["primary"]};'
+                                                f'border-radius:0 6px 6px 0;'
+                                                f'font-size:12px;color:{C["text1"]};'
+                                                f'line-height:1.6;">'
+                                                f'<span style="font-size:10px;font-weight:600;'
+                                                f'color:{C["primary"]};letter-spacing:.04em;">'
+                                                f'🤖 AI 変更要約</span><br>'
+                                                + _ec_ai.replace("<","&lt;").replace(">","&gt;")
+                                                + "</div>"
+                                            )
+
+                                        # 承認ボタン（未デプロイ・承認待ち中のもの）
+                                        if not _ec_deployed and _ec_tid in _eapi_cfg_pending:
+                                            ui.separator().style(
+                                                f"margin:6px 0;background:{C['border']};"
+                                            )
+                                            def _make_eapi_approve_diff(tid, ent):
+                                                async def _approve():
+                                                    try:
+                                                        _r = await api_post(
+                                                            f"/deploy/{tid}", _deploy_payload()
+                                                        )
+                                                        _ok = (_r.get("status") == "success")
+                                                        ent["deployed"]      = _ok
+                                                        ent["deploy_status"] = _r.get("status")
+                                                        _eapi_cfg_pending.pop(tid, None)
+                                                        render_diff_tab()
+                                                        ui.notify(
+                                                            L("eapi_cfg_success") if _ok
+                                                            else f"❌ Commit 失敗: {_r.get('status')}",
+                                                            color="positive" if _ok else "negative",
+                                                        )
+                                                    except Exception as _e:
+                                                        _err = str(_e)
+                                                        if "parent element" not in _err and "slot" not in _err:
+                                                            ui.notify(f"❌ Commit エラー: {_err}", type="negative")
+                                                return _approve
+                                            with ui.row().style(
+                                                "gap:10px;align-items:center;width:100%;"
+                                            ):
+                                                ui.label(
+                                                    "差分を確認してください。承認すると running-config に commit されます。"
+                                                ).style(
+                                                    f"font-size:11px;color:{C['text2']};flex:1;"
+                                                )
+                                                ui.button(
+                                                    L("eapi_cfg_commit"), icon="check_circle"
+                                                ).style(
+                                                    f"font-size:12px;font-weight:600;"
+                                                    f"background:{C['success_bg']};color:{C['success_fg']};"
+                                                    f"border:0.5px solid {C['success_fg']}66;"
+                                                    "border-radius:6px;padding:4px 16px;min-height:32px;"
+                                                ).on("click", _make_eapi_approve_diff(_ec_tid, entry))
+
+                                        # Commit 完了表示
+                                        if _ec_deployed:
+                                            ui.label("✅ eAPI configure session commit 完了").style(
+                                                f"font-size:11px;color:{C['success_fg']};"
+                                            )
+                                    continue   # NETCONF 履歴の表示ロジックをスキップ
+
+                                # ── NETCONF / 既存エントリ ──────────────────────────
                                 with ui.card().style(
                                     f"background:{C['bg2']};border:0.5px solid {C['border2']};"
                                     "border-radius:10px;padding:14px 16px;"
@@ -2672,13 +2971,13 @@ def main():
                         args_str = str(e.args) if hasattr(e, "args") else ""
                         if "Diff" in args_str:
                             render_diff_tab()
-                        # Chat タブに戻ったとき → 0.1秒待ってDOM描画完了後に最下部スクロール
                         if "Chat" in args_str:
                             asyncio.create_task(scroll_to_bottom())
 
                     tabs.on("update:modelValue", lambda e: on_tab_change(e))
                     render_diff_tab()
 
+                    # ── eAPI Config: Dry-run 実行 ─────────────────────────────
                 # ── Verify タブ (ANTA) ────────────────────────────────────────
                 with ui.tab_panel(tab_verify).style(
                     f"padding:0;height:100%;display:flex;flex-direction:column;"
@@ -3225,6 +3524,443 @@ def main():
 
                     tabs.on("update:modelValue",
                             lambda e: _on_tab_change_verify(e))
+
+                # ── Diagnose タブ (v2.0.0: スナップショット差分RAG対応) ──────────
+                with ui.tab_panel(tab_diagnose).style(
+                    f"padding:0;height:100%;display:flex;flex-direction:column;"
+                    f"width:100%;background:{C['bg']};"
+                ):
+                    # ── ヘッダー ──────────────────────────────────────────────
+                    with ui.row().style(
+                        f"padding:8px 16px;border-bottom:0.5px solid {C['border']};"
+                        f"align-items:center;gap:10px;flex-shrink:0;background:{C['bg2']};"
+                    ):
+                        ui.icon("troubleshoot").style(
+                            f"color:{C['warn_fg']};font-size:14px;"
+                        )
+                        ui.label("障害診断 — Arista cEOS").style(
+                            f"font-size:12px;font-weight:600;color:{C['text']};"
+                        )
+                        ui.label("").style("flex:1;")
+                        # v2.0.0: スナップショット取得状況バッジ
+                        diag_snap_badge = ui.label("スナップショット未取得").style(
+                            f"font-size:10px;color:{C['text3']};"
+                            f"background:{C['bg3']};padding:2px 8px;"
+                            f"border-radius:4px;border:0.5px solid {C['border']};"
+                        )
+                        ui.label("diagnose_a2a_server :8005  v2.0.0").style(
+                            f"font-size:10px;color:{C['text2']};"
+                        )
+
+                    # ── ボディ ────────────────────────────────────────────────
+                    diag_body = ui.column().style(
+                        "flex:1;overflow-y:auto;padding:14px 16px;"
+                        "gap:12px;min-height:0;width:100%;"
+                    )
+
+                    with diag_body:
+                        # ── v2.0.0: スナップショット取得カード ────────────────
+                        with ui.card().style(
+                            f"background:{C['bg2']};width:100%;"
+                            f"border:0.5px solid {C['border2']};border-radius:8px;"
+                            "padding:10px 14px;gap:8px;box-shadow:none;"
+                        ):
+                            with ui.row().style(
+                                "align-items:center;gap:10px;flex-wrap:wrap;"
+                            ):
+                                ui.html(
+                                    f'<div style="background:{C["bg4"]};color:{C["text3"]};'
+                                    f'font-size:9px;padding:2px 7px;border-radius:4px;'
+                                    f'font-weight:700;letter-spacing:.08em;">STEP 1</div>'
+                                )
+                                ui.button("📸 スナップショット取得（正常時に実行）").style(
+                                    f"font-size:12px;font-weight:600;"
+                                    f"background:{C['bg3']};color:{C['text']};"
+                                    f"border:0.5px solid {C['border2']};"
+                                    "border-radius:6px;padding:4px 14px;min-height:32px;"
+                                ).on("click", lambda: asyncio.create_task(_run_snapshot()))
+                                ui.label(
+                                    "正常時の eAPI 出力を保存 → 障害診断時に差分比較に使用"
+                                ).style(f"font-size:11px;color:{C['text3']};")
+
+                        # ── 診断メニュー（プリセットボタン）─────────────────
+                        with ui.row().style("align-items:center;gap:8px;"):
+                            ui.html(
+                                f'<div style="background:{C["bg4"]};color:{C["text3"]};'
+                                f'font-size:9px;padding:2px 7px;border-radius:4px;'
+                                f'font-weight:700;letter-spacing:.08em;">STEP 2</div>'
+                            )
+                            ui.label("診断メニュー").style(
+                                f"font-size:11px;font-weight:500;color:{C['text2']};"
+                            )
+                        with ui.grid(columns=2).style("width:100%;gap:8px;"):
+                            for _flow, _icon, _title, _sub in [
+                                ("full", "account_tree",
+                                 "全レイヤ診断",     "L2 + L3 · 5エージェント"),
+                                ("l3",  "route",
+                                 "L3 診断",          "BGP / ルーティング / ARP"),
+                                ("l2",  "cable",
+                                 "L2 診断",          "インターフェース / MAC"),
+                                ("l3",  "hub",
+                                 "BGP 診断",         "BGP 特化 · EVPN 含む"),
+                            ]:
+                                with ui.card().style(
+                                    f"padding:10px 12px;cursor:pointer;width:100%;"
+                                    f"background:{C['bg2']};"
+                                    f"border:0.5px solid {C['border2']};border-radius:6px;"
+                                ).on("click", lambda f=_flow, t=_title:
+                                    asyncio.create_task(_run_diagnose(f, t))
+                                ):
+                                    ui.icon(_icon).style(
+                                        f"font-size:16px;color:{C['text2']};"
+                                    )
+                                    ui.label(_title).style(
+                                        f"font-size:12px;font-weight:500;color:{C['text']};"
+                                    )
+                                    ui.label(_sub).style(
+                                        f"font-size:11px;color:{C['text2']};"
+                                    )
+
+                        # ── 実行状況エリア ────────────────────────────────────
+                        diag_status_area = ui.column().style(
+                            "width:100%;gap:6px;"
+                        )
+
+                        # ── レポートエリア ────────────────────────────────────
+                        diag_report_area = ui.column().style("width:100%;gap:6px;")
+
+                    # ── ヘルパー: A2A レスポンスから診断JSON を取り出す ────────
+                    def _parse_diag_response(data: dict) -> dict:
+                        try:
+                            result_obj = data.get("result", {})
+                            parts = result_obj.get("parts", [])
+                            if not parts:
+                                parts = result_obj.get("message", {}).get("parts", [])
+                            for part in parts:
+                                text_val = None
+                                if part.get("kind") == "text":
+                                    text_val = part.get("text", "")
+                                elif isinstance(part.get("root"), dict):
+                                    text_val = part["root"].get("text", "")
+                                if text_val:
+                                    try:
+                                        return json.loads(text_val)
+                                    except Exception:
+                                        return {"report": text_val, "status": "success"}
+                            return {"report": str(data)[:500], "status": "error"}
+                        except Exception as _pe:
+                            return {"report": str(data)[:500], "status": "error",
+                                    "parse_error": str(_pe)}
+
+                    # ── v2.0.0: スナップショット取得関数 ─────────────────────
+                    async def _run_snapshot():
+                        """
+                        mode="snapshot" で diagnose_a2a_server に送信し、
+                        正常時のeAPI出力をサーバ側に保存する。
+                        """
+                        diag_status_area.clear()
+                        diag_report_area.clear()
+
+                        with diag_status_area:
+                            ui.label("📸 スナップショット取得中...").style(
+                                f"font-size:12px;font-weight:500;color:{C['warn_fg']};"
+                            )
+
+                        payload_text = json.dumps({
+                            "mode":       "snapshot",
+                            "vendor_key": "arista_ceos",
+                            "flow":       "full",
+                        }, ensure_ascii=False)
+                        a2a_payload = {
+                            "jsonrpc": "2.0", "id": "snap-diag",
+                            "method": "message/send",
+                            "params": {"message": {
+                                "role": "user",
+                                "parts": [{"text": payload_text}],
+                                "messageId": f"snap-{datetime.now().strftime('%H%M%S')}",
+                            }},
+                        }
+
+                        try:
+                            async with httpx.AsyncClient(timeout=60) as client:
+                                resp = await client.post(DIAGNOSE_URL, json=a2a_payload)
+                                resp.raise_for_status()
+                                result_json = _parse_diag_response(resp.json())
+
+                            saved  = result_json.get("saved_cmds",   [])
+                            skipped = result_json.get("skipped_cmds", [])
+                            ts      = result_json.get("captured_at",  "")
+
+                            diag_status_area.clear()
+                            with diag_status_area:
+                                if result_json.get("status") == "success":
+                                    ui.label(
+                                        f"✅ スナップショット取得完了 — {len(saved)}件保存"
+                                    ).style(
+                                        f"font-size:12px;font-weight:500;"
+                                        f"color:{C['success_fg']};"
+                                    )
+                                    if ts:
+                                        ui.label(f"取得日時: {ts}").style(
+                                            f"font-size:10px;color:{C['text3']};"
+                                        )
+                                    with ui.row().style(
+                                        "flex-wrap:wrap;gap:6px;margin-top:4px;"
+                                    ):
+                                        for cmd in saved:
+                                            ui.label(cmd).style(
+                                                f"font-size:10px;color:{C['success_fg']};"
+                                                f"background:{C['success_bg']};"
+                                                f"border:0.5px solid {C['success_fg']}33;"
+                                                "border-radius:4px;padding:2px 8px;"
+                                                f"font-family:monospace;"
+                                            )
+                                    if skipped:
+                                        ui.label(
+                                            f"スキップ: {', '.join(skipped)}"
+                                        ).style(
+                                            f"font-size:10px;color:{C['warn_fg']};"
+                                        )
+                                    # ヘッダーバッジを更新
+                                    diag_snap_badge.text = (
+                                        f"📸 スナップショット取得済み {ts[:10]}"
+                                    )
+                                    diag_snap_badge.style(
+                                        f"font-size:10px;color:{C['success_fg']};"
+                                        f"background:{C['success_bg']};padding:2px 8px;"
+                                        f"border-radius:4px;"
+                                        f"border:0.5px solid {C['success_fg']}44;"
+                                    )
+                                else:
+                                    ui.label(
+                                        f"❌ 取得失敗: {result_json.get('message','')}"
+                                    ).style(
+                                        f"font-size:12px;color:{C['danger_fg']};"
+                                    )
+                        except Exception as exc:
+                            diag_status_area.clear()
+                            with diag_status_area:
+                                ui.label(f"❌ エラー: {exc}").style(
+                                    f"font-size:12px;color:{C['danger_fg']};"
+                                )
+
+                    # ── 診断実行関数 ──────────────────────────────────────────
+                    async def _run_diagnose(flow: str, title: str):
+                        """
+                        diagnose_a2a_server (8005) に A2A リクエストを送信し、
+                        実行状況とレポートをタブ内に表示する。
+                        v2.0.0: snapshot_used フラグ・L2/L3分析の折りたたみ表示を追加。
+                        """
+                        diag_status_area.clear()
+                        diag_report_area.clear()
+
+                        # ── 実行中表示 ────────────────────────────────────────
+                        with diag_status_area:
+                            ui.label(f"▶ {title} 実行中...").style(
+                                f"font-size:12px;font-weight:500;color:{C['warn_fg']};"
+                            )
+                            _steps = [
+                                ("フロー判定",           None),
+                                ("eAPI コマンド実行",     None),
+                                ("L2 分析エージェント",   None),
+                                ("L3 分析エージェント",   None),
+                                ("整合性チェック",        None),
+                                ("診断レポート生成",       None),
+                            ] if flow == "full" else [
+                                ("フロー判定",            None),
+                                ("eAPI コマンド実行",     None),
+                                ("L3 分析エージェント",   None),
+                                ("整合性チェック",        None),
+                                ("診断レポート生成",       None),
+                            ] if flow == "l3" else [
+                                ("フロー判定",            None),
+                                ("eAPI コマンド実行",     None),
+                                ("L2 分析エージェント",   None),
+                                ("整合性チェック",        None),
+                                ("診断レポート生成",       None),
+                            ]
+                            step_labels = {}
+                            for step_name, _ in _steps:
+                                with ui.row().style("align-items:center;gap:8px;"):
+                                    icon_el = ui.icon("radio_button_unchecked").style(
+                                        f"font-size:14px;color:{C['text2']};"
+                                    )
+                                    lbl = ui.label(step_name).style(
+                                        f"font-size:12px;color:{C['text2']};"
+                                    )
+                                    step_labels[step_name] = (icon_el, lbl)
+
+                        # ── A2A リクエスト送信 ────────────────────────────────
+                        query_map = {
+                            "full": "ネットワーク全体の正常性を診断してください。",
+                            "l3":   "L3層（BGP・ルーティング・ARP）を診断してください。",
+                            "l2":   "L2層（インターフェース・MAC）を診断してください。",
+                        }
+                        query_text   = query_map.get(flow, "ネットワークを診断してください。")
+                        payload_text = json.dumps({
+                            "query":      query_text,
+                            "vendor_key": "arista_ceos",
+                            "flow":       flow,
+                        }, ensure_ascii=False)
+
+                        a2a_payload = {
+                            "jsonrpc": "2.0", "id": "diag-1",
+                            "method": "message/send",
+                            "params": {"message": {
+                                "role": "user",
+                                "parts": [{"text": payload_text}],
+                                "messageId": f"diag-{datetime.now().strftime('%H%M%S')}",
+                            }},
+                        }
+
+                        started = datetime.now()
+                        try:
+                            async with httpx.AsyncClient(timeout=120) as client:
+                                resp = await client.post(DIAGNOSE_URL, json=a2a_payload)
+                                resp.raise_for_status()
+                                result_json = _parse_diag_response(resp.json())
+
+                            elapsed       = (datetime.now() - started).total_seconds()
+                            snapshot_used = result_json.get("snapshot_used", False)
+
+                            # ── ステップ完了アイコンに更新 ────────────────────
+                            for step_name, (icon_el, lbl) in step_labels.items():
+                                icon_el.props("name=check_circle").style(
+                                    f"font-size:14px;color:{C['success_fg']};"
+                                )
+                                lbl.style(f"font-size:12px;color:{C['text']};")
+
+                            diag_status_area.clear()
+                            with diag_status_area:
+                                with ui.row().style(
+                                    "align-items:center;gap:8px;flex-wrap:wrap;"
+                                ):
+                                    ui.label(
+                                        f"✅ {title} 完了 — {elapsed:.1f}秒"
+                                    ).style(
+                                        f"font-size:12px;font-weight:500;"
+                                        f"color:{C['success_fg']};"
+                                    )
+                                    # v2.0.0: 差分RAG使用フラグ
+                                    if snapshot_used:
+                                        ui.label("📊 差分RAG使用").style(
+                                            f"font-size:10px;color:{C['info_fg']};"
+                                            f"background:{C['info_bg']};padding:2px 8px;"
+                                            f"border-radius:4px;"
+                                            f"border:0.5px solid {C['info_fg']}44;"
+                                        )
+                                    else:
+                                        ui.label("スナップショットなし").style(
+                                            f"font-size:10px;color:{C['text3']};"
+                                            f"background:{C['bg3']};padding:2px 8px;"
+                                            f"border-radius:4px;"
+                                            f"border:0.5px solid {C['border']};"
+                                        )
+                                # Self-Correction 発動表示
+                                if result_json.get("self_correction_triggered"):
+                                    ui.label(
+                                        "🔄 Self-Correction 発動: L3 エージェントが再分析しました"
+                                    ).style(
+                                        f"font-size:11px;color:{C['warn_fg']};"
+                                        f"padding:4px 8px;"
+                                        f"border-left:2px solid {C['warn_fg']};"
+                                    )
+
+                            # ── レポート表示 ──────────────────────────────────
+                            diag_report_area.clear()
+                            with diag_report_area:
+                                ui.label("診断レポート").style(
+                                    f"font-size:11px;font-weight:500;color:{C['text2']};"
+                                )
+                                report_text = result_json.get("report", str(result_json))
+                                with ui.card().style(
+                                    f"width:100%;padding:12px 14px;"
+                                    f"background:{C['bg2']};"
+                                    f"border:0.5px solid {C['border']};border-radius:6px;"
+                                ):
+                                    ui.markdown(report_text).style(
+                                        f"font-size:12px;color:{C['text']};line-height:1.7;"
+                                    )
+
+                                # v2.0.0: L2分析（折りたたみ）
+                                l2_analysis = result_json.get("l2_analysis", "")
+                                if l2_analysis and "スキップ" not in l2_analysis:
+                                    with ui.expansion(
+                                        "L2 分析結果", icon="cable",
+                                    ).props("dense dark").style(
+                                        f"width:100%;font-size:11px;color:{C['text2']};"
+                                        f"background:{C['bg2']};border:0.5px solid {C['border']};"
+                                        "border-radius:6px;margin-top:4px;"
+                                    ):
+                                        ui.html(
+                                            f'<div style="background:{C["bg3"]};'
+                                            f'border-radius:6px;padding:10px 12px;'
+                                            f'font-size:11px;color:{C["text2"]};'
+                                            f'line-height:1.7;white-space:pre-wrap;">'
+                                            + l2_analysis.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                                            + "</div>"
+                                        )
+
+                                # v2.0.0: L3分析（折りたたみ）
+                                l3_text = (
+                                    result_json.get("l3_analysis_corrected")
+                                    or result_json.get("l3_analysis", "")
+                                )
+                                if l3_text and "スキップ" not in l3_text:
+                                    with ui.expansion(
+                                        "L3 分析結果", icon="route",
+                                    ).props("dense dark").style(
+                                        f"width:100%;font-size:11px;color:{C['text2']};"
+                                        f"background:{C['bg2']};border:0.5px solid {C['border']};"
+                                        "border-radius:6px;margin-top:4px;"
+                                    ):
+                                        ui.html(
+                                            f'<div style="background:{C["bg3"]};'
+                                            f'border-radius:6px;padding:10px 12px;'
+                                            f'font-size:11px;color:{C["text2"]};'
+                                            f'line-height:1.7;white-space:pre-wrap;">'
+                                            + l3_text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                                            + "</div>"
+                                        )
+
+                                # コマンド実行結果（折りたたみ）
+                                cmds_executed = result_json.get("commands_executed", {})
+                                if cmds_executed:
+                                    with ui.expansion(
+                                        f"実行コマンド ({len(cmds_executed)}件)",
+                                        icon="terminal",
+                                    ).props("dense dark").style(
+                                        f"width:100%;font-size:11px;color:{C['text2']};"
+                                        f"background:{C['bg2']};border:0.5px solid {C['border']};"
+                                        "border-radius:6px;margin-top:4px;"
+                                    ):
+                                        for cmd, res in cmds_executed.items():
+                                            _st    = res.get("status", "?")
+                                            _color = (C["success_fg"] if _st == "ok"
+                                                      else C["warn_fg"] if _st == "empty"
+                                                      else C["danger_fg"])
+                                            with ui.row().style(
+                                                "align-items:center;gap:6px;padding:2px 0;"
+                                            ):
+                                                ui.icon(
+                                                    "check" if _st == "ok"
+                                                    else "remove" if _st == "empty"
+                                                    else "error"
+                                                ).style(f"font-size:12px;color:{_color};")
+                                                ui.label(cmd).style(
+                                                    f"font-size:11px;color:{C['text']};"
+                                                    f"font-family:monospace;"
+                                                )
+                                                ui.label(f"[{_st}]").style(
+                                                    f"font-size:10px;color:{_color};"
+                                                )
+
+                        except Exception as exc:
+                            diag_status_area.clear()
+                            with diag_status_area:
+                                ui.label(f"❌ エラー: {exc}").style(
+                                    f"font-size:12px;color:{C['danger_fg']};"
+                                )
 
                 # ── Security タブ ─────────────────────────────────────────────
                 with ui.tab_panel(tab_security).style(
