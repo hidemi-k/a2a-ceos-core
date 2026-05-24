@@ -103,6 +103,7 @@
 > **通信経路の補足**
 > - Security タブのリアルタイム表示（Top Traffic・Drop List・QoS List）は A2A Hub を経由せず、Web UI から Go IPS（:8080）へ直接 GET します。
 > - Diagnose タブは A2A Hub を経由せず、Web UI から Diagnose Agent（:8005）へ直接 A2A リクエストを送ります。
+> - Verify タブの Before Snapshot・Post-Check ボタンは A2A Hub を経由せず、Web UI から ANTA Agent（:8004）へ直接 A2A リクエストを送ります（Chat からの `verify` キーワードクエリは Hub 経由）。
 > - チャット入力からのセキュリティ操作・VXLAN/EVPN 設定変更・BGP network/redistribute は Hub → 各エージェントの順に処理されます。
 
 ### Azure 構成
@@ -161,6 +162,7 @@
 └─────────────────────────────────────────────────┘
 
 ※ Diagnose Agent（:8005）は Hub を経由せず Web UI から直接呼び出します。
+※ Verify タブ（Before Snapshot / Post-Check）も Hub を経由せず Web UI から ANTA Agent（:8004）へ直接呼び出します。Chat からの `verify` キーワードクエリのみ Hub 経由です。
 ```
 
 ---

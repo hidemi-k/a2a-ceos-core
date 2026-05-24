@@ -103,6 +103,7 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 > **Communication path note**
 > - Security tab real-time display (Top Traffic / Drop List / QoS List) polls Go IPS (:8080) **directly** from the Web UI — bypassing the A2A Hub.
 > - Diagnose tab sends A2A requests **directly** from the Web UI to Diagnose Agent (:8005) — bypassing the A2A Hub.
+> - Verify tab Before Snapshot / Post-Check buttons send A2A requests **directly** from the Web UI to ANTA Agent (:8004) — bypassing the A2A Hub. (`verify` keyword queries from Chat go through the Hub.)
 > - Security operations and VXLAN/EVPN config changes and BGP network/redistribute triggered via chat go through Hub → respective agent as usual.
 
 ### Azure components
@@ -161,6 +162,7 @@ Natural language query
 └─────────────────────────────────────────────────────┘
 
 Note: Diagnose Agent (:8005) is called directly from the Web UI, bypassing the Hub.
+Note: Verify tab (Before Snapshot / Post-Check) also calls ANTA Agent (:8004) directly from the Web UI, bypassing the Hub. Only `verify` keyword queries from Chat go through the Hub.
 ```
 
 ---
