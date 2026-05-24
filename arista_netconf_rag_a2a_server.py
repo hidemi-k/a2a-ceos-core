@@ -893,6 +893,7 @@ def audit_deployment(xml_config, device_ip, username, password, port="830"):
 def get_device_inventory(device_ip, username, password, port="830"):
     try:
         with _connect_with_retry(device_ip, port, username, password) as m:
+            # インターフェース取得
             result = m.get_config(
                 source="running",
                 filter=("subtree", f'<interfaces xmlns="{OC_INTF_NS}"/>'),
@@ -904,11 +905,38 @@ def get_device_inventory(device_ip, username, password, port="830"):
                 and any(e.text.strip().startswith(p)
                         for p in ("Ethernet", "Management", "Loopback", "Vlan", "Port"))
             ))
+            # VLAN一覧取得（ID + 名前）— VLAN名→ID逆引き用
+            vlans = []
+            try:
+                vlan_result = m.get_config(
+                    source="running",
+                    filter=("subtree",
+                            f'<network-instances xmlns="{OC_NI_NS}">'
+                            f'<network-instance><name>default</name>'
+                            f'<vlans/></network-instance></network-instances>'),
+                )
+                vr = ET.fromstring(vlan_result.data_xml)
+                for vlan_el in vr.iter():
+                    if vlan_el.tag.split("}")[-1] != "vlan":
+                        continue
+                    vid, vname = "", ""
+                    for child in vlan_el:
+                        local = child.tag.split("}")[-1]
+                        if local == "vlan-id" and child.text:
+                            vid = child.text.strip()
+                        if local == "config":
+                            for sub in child:
+                                if sub.tag.split("}")[-1] == "name" and sub.text:
+                                    vname = sub.text.strip()
+                    if vid.isdigit():
+                        vlans.append({"id": int(vid), "name": vname})
+            except Exception as ve:
+                logger.warning(f"VLAN inventory 取得失敗（無視）: {ve}")
             return {
                 "status": "success",
                 "interfaces": intfs, "interface_names": intfs,
-                "vlans": [], "raw_config": result.data_xml,
-                "message": f"Retrieved {len(intfs)} interfaces from {device_ip}",
+                "vlans": vlans, "raw_config": result.data_xml,
+                "message": f"Retrieved {len(intfs)} interfaces, {len(vlans)} VLANs from {device_ip}",
             }
     except Exception as e:
         return {"status": "failure", "interfaces": [], "interface_names": [],
@@ -1008,6 +1036,11 @@ Input: "VLAN 101 を削除してください"
 Output: {"tasks":[{"id":"task_1","operation":"delete_vlan","target":"101",
   "yang_path":"/network-instances/network-instance[name=default]/vlans/vlan[vlan-id=101]",
   "value":null,"description":"Delete VLAN 101","depends_on":[]}]}
+
+Input: "DEV8_VLAN を削除したい"
+Output: {"tasks":[{"id":"task_1","operation":"delete_vlan","target":"DEV8_VLAN",
+  "yang_path":"/network-instances/network-instance[name=default]/vlans",
+  "value":null,"description":"Delete VLAN named DEV8_VLAN (resolve ID from inventory)","depends_on":[]}]}
 """
 
 
@@ -1017,6 +1050,7 @@ def decompose_tasks(user_query, llm=None, inventory=None):
     try:
         inv_sect = (
             f"Existing interfaces: {inventory.get('interface_names', [])}\n"
+            f"Existing VLANs: {[{'id': v['id'], 'name': v['name']} for v in inventory.get('vlans', [])]}\n"
             f"Raw config:\n{inventory.get('raw_config', '')[:500]}"
         ) if inventory and inventory.get("status") == "success" else "(not available)"
 
@@ -1320,9 +1354,12 @@ def check_policy(task: dict, xml_config: str, policy: dict = None) -> dict:
 
     # ② VLAN ID allowlist（空リスト = 全許可）
     # task の vlan_id キーに依存せず、生成 XML の <vlan-id> を直接スキャンする。
-    # task_decomposer のキー名揺れ（vlan_id / target_vlan / target 等）に左右されない。
+    # ★ 削除操作（operation="delete"）は allowlist チェックから除外する。
+    #   allowlist の目的は「新規作成・変更を ID で制限する」ことであり、
+    #   既存 VLAN の削除を ID 制限でブロックするのはポリシーの趣旨に反する。
     allowed_ids = policy.get("allowed_vlan_ids", [])
-    if allowed_ids and xml_config:
+    is_delete_op = 'operation="delete"' in xml_config or "operation='delete'" in xml_config
+    if allowed_ids and xml_config and not is_delete_op:
         xml_vlan_ids = re.findall(r"<vlan-id>\s*(\d+)\s*</vlan-id>", xml_config, re.IGNORECASE)
         for vid_str in xml_vlan_ids:
             try:
@@ -1431,6 +1468,82 @@ CRITICAL VLAN RULES:
 - vlan-id MUST appear BOTH as element key AND inside <config>
 - NEVER use Junos-style <vlans><vlan><name>VLAN_NAME</name> structure
 - NEVER omit the <network-instance><name>default</name> wrapper
+
+BGP NEIGHBOR (description / config update):
+description だけを変更する場合は <peer-as> を絶対に含めない。
+cEOS 実機確認済みの正しい構造:
+
+```
+<config>
+  <network-instances xmlns="http://openconfig.net/yang/network-instance">
+    <network-instance>
+      <name>default</name>
+      <protocols>
+        <protocol>
+          <identifier>BGP</identifier>
+          <name>BGP</name>
+          <config>
+            <identifier>BGP</identifier>
+            <name>BGP</name>
+          </config>
+          <bgp xmlns="http://openconfig.net/yang/bgp">
+            <neighbors>
+              <neighbor>
+                <neighbor-address>10.0.20.150</neighbor-address>
+                <config>
+                  <neighbor-address>10.0.20.150</neighbor-address>
+                  <description>uplink-peer</description>
+                </config>
+              </neighbor>
+            </neighbors>
+          </bgp>
+        </protocol>
+      </protocols>
+    </network-instance>
+  </network-instances>
+</config>
+```
+
+CRITICAL BGP NEIGHBOR RULES:
+- description のみ変更する場合: <peer-as> を絶対に含めない（HIGH_RISK でブロックされる）
+- <peer-as> は AS 番号変更操作の場合のみ使用する
+- neighbor-address は <config> 内にも必ず繰り返す
+
+ROUTING-POLICY (prefix-set / BGP network advertise):
+cEOS 実機確認済みの正しい値を使うこと。
+
+```
+<config>
+  <routing-policy xmlns="http://openconfig.net/yang/routing-policy">
+    <defined-sets>
+      <prefix-sets>
+        <prefix-set>
+          <name>ADVERTISE_PREFIXES</name>
+          <config>
+            <name>ADVERTISE_PREFIXES</name>
+            <mode>IPV4</mode>
+          </config>
+          <prefixes>
+            <prefix>
+              <ip-prefix>192.168.1.0/24</ip-prefix>
+              <masklength-range>exact</masklength-range>
+              <config>
+                <ip-prefix>192.168.1.0/24</ip-prefix>
+                <masklength-range>exact</masklength-range>
+              </config>
+            </prefix>
+          </prefixes>
+        </prefix-set>
+      </prefix-sets>
+    </defined-sets>
+  </routing-policy>
+</config>
+```
+
+CRITICAL ROUTING-POLICY RULES:
+- <mode> の値は必ず大文字: IPV4 / IPV6 / MIXED（小文字 "ip-prefix" は無効）
+- <masklength-range> は完全一致の場合 "exact"、範囲指定は "24..32" 形式
+- prefix-set だけでは BGP advertise は完結しない。policy-definition と BGP neighbor への適用も必要
 
 If you cannot generate XML, output ONLY: <filter/>
 """
@@ -1880,6 +1993,30 @@ class OrchestratorAgentArista:
             self.audit_logger.record_blocked(task, "skipped")
             return skipped
 
+        # ── VLAN削除: VLAN IDが必須チェック ─────────────────────────────────
+        # ネットワーク運用の原則: VLAN操作はVLAN IDで行う（名前は一意でないため危険）。
+        if task.get("operation") == "delete_vlan":
+            target = task.get("target", "")
+            if not str(target).strip().isdigit():
+                inv = getattr(self, '_last_inventory', None)
+                vlan_list = inv.get("vlans", []) if inv else []
+                vlan_info = "、".join(
+                    f"VLAN {v['id']}: {v['name']}" for v in vlan_list if v.get("name")
+                ) or "（VLAN一覧未取得）"
+                msg = (
+                    f"VLAN削除にはVLAN IDの指定が必要です。"
+                    f"VLAN名 '{target}' からの自動解決は行いません（名前は一意でないため危険）。\n"
+                    f"現在のVLAN一覧: {vlan_info}\n"
+                    f"例: 'VLAN 108 を削除して' のようにVLAN IDで指定してください。"
+                )
+                self.log(f"[VLAN delete] ❌ {msg}")
+                self.audit_logger.record_blocked(task, msg)
+                return {
+                    "validation_status": False,
+                    "deployment_status": {"status": "blocked", "diff": "", "message": msg},
+                    "audit_status": None, "rollback_status": None,
+                }
+
         # ── BGP neighbor 削除専用処理 ────────────────────────────────────────
         # Arista cEOS では nc:operation="delete" on neighbor が動作しない。
         # 正しい削除方法: 現在の neighbor 一覧を取得し、削除対象を除いた
@@ -2118,7 +2255,9 @@ class OrchestratorAgentArista:
             )
             if inv and inv.get("status") == "success":
                 inventory = inv
+                self._last_inventory = inv  # VLAN名→ID逆引き用に保持
                 self.log(f"   interfaces: {inv.get('interface_names', [])}")
+                self.log(f"   VLANs: {[{'id': v['id'], 'name': v['name']} for v in inv.get('vlans', [])]}")
 
         # Step 1: task_decomposer
         self.log("\n[Step 1] task_decomposer")

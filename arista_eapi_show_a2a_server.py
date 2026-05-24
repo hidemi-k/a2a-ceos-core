@@ -27,7 +27,7 @@ pyeapi (https/443) で show コマンドを実行し、
     FAISS_PATH     : faiss_db のパス（デフォルト: ./faiss_db/arista_eapi）
     SASE_CONFIG    : config.ini のパス
     EAPI_HOST      : デバイスIP（デフォルト: 172.20.100.31）
-    EAPI_PORT_NUM  : eAPI ポート番号（デフォルト: 443）
+    EAPI_PORT  : eAPI ポート番号（デフォルト: 443）
     EAPI_TRANSPORT : http or https（デフォルト: https）
     EAPI_USER      : ユーザー名（デフォルト: admin）
     EAPI_PASS      : パスワード（デフォルト: admin）
@@ -124,7 +124,7 @@ A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 
 # デフォルト接続設定（実機確認済みパラメータ）
 DEFAULT_EAPI_HOST      = os.getenv("EAPI_HOST",      "172.20.100.31")
-DEFAULT_EAPI_PORT      = int(os.getenv("EAPI_PORT_NUM", "443"))
+DEFAULT_EAPI_PORT      = int(os.getenv("EAPI_PORT", "443"))
 DEFAULT_EAPI_TRANSPORT = os.getenv("EAPI_TRANSPORT", "https")
 DEFAULT_EAPI_USER      = os.getenv("EAPI_USER",      "admin")
 DEFAULT_EAPI_PASS      = os.getenv("EAPI_PASS",      "admin")
@@ -278,12 +278,19 @@ def _eapi_node(host: str, port: int, transport: str,
     pyeapi.connect() → Node 経由で接続する。
     実機確認済み: transport=https, port=443（HTTP/80はshutdown）
     SSL証明書: 自己署名（urllib3 警告は起動時に無効化済み）
+
+    ★ 2026-05-24 修正: enable_password を設定し privileged mode で接続する。
+       "show running-config" 等は privileged mode 必須（"% Invalid input" 回避）。
+       pyeapi は Node(conn, enablepwd=...) で enable コマンドを自動付与する。
     """
     conn = pyeapi.connect(
         transport=transport, host=host,
         username=username, password=password, port=port,
     )
-    return pyeapi.client.Node(conn)
+    # enable_password: cEOS デフォルトは空文字（パスワードなし）
+    # 環境変数 EAPI_ENABLE_PASS で上書き可能
+    enable_pwd = os.getenv("EAPI_ENABLE_PASS", "")
+    return pyeapi.client.Node(conn, enablepwd=enable_pwd)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1319,33 +1326,64 @@ class AristaEapiShowExecutor(AgentExecutor):
 
             logger.info(f"実行コマンド: {cmds}")
 
+            # ── text encoding が必要なコマンド検出 ────────────────────────────
+            # 以下のコマンドは encoding="text" で実行し LLM パースに直行する：
+            #   1. show running-config / show startup-config
+            #      - privileged mode 必須（_eapi_node の enablepwd で対応済み）
+            #      - encoding="json" 非対応
+            #   2. show ip bgp neighbors [IP]
+            #      - JSON 構造パースでは description・Capabilities・エラーカウンタ等
+            #        多くの詳細フィールドが欠落するため、text 出力を LLM に整形させる
+            _TEXT_ENCODING_PREFIXES = (
+                "show running-config",
+                "show startup-config",
+                "show ip bgp neighbors",
+                "show bgp neighbors",
+            )
+            _needs_text_encoding = any(
+                str(cmd).strip().lower().startswith(p)
+                for cmd in cmds
+                for p in _TEXT_ENCODING_PREFIXES
+            )
+
             # ④ pyeapi 実行（https/443 確定済み）
-            node       = _eapi_node(host, port, transport, username, password)
-            raw_result = node.run_commands(cmds, encoding="json")
+            node = _eapi_node(host, port, transport, username, password)
+
+            if _needs_text_encoding:
+                # text encoding 対象: encoding="text" で直接 LLM パース
+                logger.info(f"text encoding系: encoding=text で実行 ({cmds})")
+                text_result    = node.run_commands(cmds, encoding="text")
+                formatted_text = await _llm_format_text(cmds, text_result, self._llm)
+                parse_method   = "text+llm"
+                raw_result     = text_result  # response_payload の raw_result 用
+            else:
+                raw_result = node.run_commands(cmds, encoding="json")
 
             # ⑤ ハイブリッドパース:
             #    structured パース → None なら text フォーマットで再取得 → LLM パース
             #    text フォーマット非対応なら JSON を LLM パース（8000字制限・最終手段）
-            structured_text = _format_interfaces(raw_result)
+            #    ★ running-config 系は上記④で text+LLM 済みのためスキップ
+            if not _needs_text_encoding:
+                structured_text = _format_interfaces(raw_result)
 
-            if structured_text is not None:
-                # structured パース成功
-                parse_method   = "structured"
-                formatted_text = structured_text
-                logger.info(f"パース方式: structured ({cmds})")
-            else:
-                # structured パース未対応 → text フォーマットで再取得して LLM に渡す
-                logger.info(f"パース方式: text+LLM フォールバック ({cmds})")
-                try:
-                    text_result = node.run_commands(cmds, encoding="text")
-                    formatted_text = await _llm_format_text(cmds, text_result, self._llm)
-                    parse_method   = "text+llm"
-                    logger.info(f"パース方式: text+LLM 成功 ({cmds})")
-                except Exception as e:
-                    # text フォーマット非対応 → JSON LLM パース（最終手段）
-                    logger.warning(f"text フォーマット非対応: {e} → JSON LLM パース（8000字制限）")
-                    formatted_text = await _llm_format_raw(cmds, raw_result, self._llm)
-                    parse_method   = "json+llm(fallback)"
+                if structured_text is not None:
+                    # structured パース成功
+                    parse_method   = "structured"
+                    formatted_text = structured_text
+                    logger.info(f"パース方式: structured ({cmds})")
+                else:
+                    # structured パース未対応 → text フォーマットで再取得して LLM に渡す
+                    logger.info(f"パース方式: text+LLM フォールバック ({cmds})")
+                    try:
+                        text_result = node.run_commands(cmds, encoding="text")
+                        formatted_text = await _llm_format_text(cmds, text_result, self._llm)
+                        parse_method   = "text+llm"
+                        logger.info(f"パース方式: text+LLM 成功 ({cmds})")
+                    except Exception as e:
+                        # text フォーマット非対応 → JSON LLM パース（最終手段）
+                        logger.warning(f"text フォーマット非対応: {e} → JSON LLM パース（8000字制限）")
+                        formatted_text = await _llm_format_raw(cmds, raw_result, self._llm)
+                        parse_method   = "json+llm(fallback)"
 
             response_payload = {
                 "query":          query,

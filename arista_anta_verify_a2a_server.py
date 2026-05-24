@@ -49,7 +49,7 @@ JSON-RPC で返す A2A サーバ。
     A2A_PORT       : ポート番号（デフォルト: 8004）
     A2A_PUBLIC_URL : 外部公開URL（デフォルト: http://localhost:8004）
     EAPI_HOST      : デバイスIP（デフォルト: 172.20.100.31）
-    EAPI_PORT_NUM  : eAPI ポート番号（デフォルト: 443）
+    EAPI_PORT  : eAPI ポート番号（デフォルト: 443）
     EAPI_USER      : ユーザー名（デフォルト: admin）
     EAPI_PASS      : パスワード（デフォルト: admin）
     EAPI_INSECURE  : 自己署名証明書を許可 "true"/"false"（デフォルト: true）
@@ -152,7 +152,7 @@ A2A_PORT       = int(os.getenv("A2A_PORT",   "8004"))
 A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 
 DEFAULT_EAPI_HOST     = os.getenv("EAPI_HOST",      "172.20.100.31")
-DEFAULT_EAPI_PORT     = int(os.getenv("EAPI_PORT_NUM", "443"))
+DEFAULT_EAPI_PORT     = int(os.getenv("EAPI_PORT", "443"))
 DEFAULT_EAPI_USER     = os.getenv("EAPI_USER",      "admin")
 DEFAULT_EAPI_PASS     = os.getenv("EAPI_PASS",      "admin")
 # cEOS 自己署名証明書: insecure=True が必要（実機確認済み）

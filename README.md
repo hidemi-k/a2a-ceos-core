@@ -2,11 +2,12 @@
 
 ## 🔥 Why it matters
 
-- **OSS that unifies NETCONF / eAPI / ANTA / XDP via A2A and operates Arista cEOS safely with natural language**
-- **Junos-equivalent `commit check` diff reproduced on cEOS** — Dry-run → diff → approval → NETCONF deploy → ANTA Post-Check, fully automated
+- **OSS that unifies NETCONF / eAPI / eAPI Config / ANTA / XDP via A2A and operates Arista cEOS safely with natural language**
+- **Junos-equivalent `commit check` diff reproduced on cEOS** — Dry-run → diff → approval → NETCONF / eAPI Config deploy → ANTA Post-Check, fully automated
+- **Snapshot-diff RAG powered multi-agent fault diagnosis** — 5 specialist agents collaborate using normal-state diff as evidence, with automatic Self-Correction
 - Agents integrated via A2A protocol. Groq → Azure OpenAI automatic fallback guarantees production reliability
 - XDP/eBPF AI-controlled with Human-in-the-loop — existing C/Go assets integrated without modification
-- Validated on real hardware via Containerlab (cEOS 4.36.0F). XDP security demo confirmed working
+- Validated on real hardware via Containerlab (cEOS 4.36.0F). 
 
 ---
 
@@ -14,10 +15,11 @@
 
 | | |
 |---|---|
-| **Unified** | NETCONF / eAPI / ANTA / XDP integrated via A2A — operated with a single natural-language sentence |
-| **Safe** | Dry-run → +/- diff → human approval → NETCONF deploy → ANTA auto Post-Check |
+| **Unified** | NETCONF / eAPI / eAPI Config / ANTA / XDP integrated via A2A — operated with a single natural-language sentence |
+| **Safe** | Dry-run → +/- diff → human approval → NETCONF / eAPI Config deploy → ANTA auto Post-Check |
+| **Diagnosis** | Snapshot-diff RAG → 5-agent fault diagnosis with Self-Correction |
 | **Proven** | Validated on Containerlab (cEOS 4.36.0F). XDP security demo available |
-| **AI** | A2A Hub classifies intent via LLM → delegates to specialist agents (NETCONF / eAPI / XDP / ANTA) |
+| **AI** | A2A Hub classifies intent via LLM → delegates to specialist agents (NETCONF / eAPI / eAPI Config / XDP / ANTA / Diagnose) |
 | **Microsoft** | Azure Container Apps + Azure VM + Azure OpenAI + Microsoft Agent Framework |
 
 ---
@@ -41,9 +43,11 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 
 - 🔄 **Natural language → NETCONF XML → Dry-run → diff → approval → deploy** (Junos-equivalent pre-diff on cEOS)
 - 🔍 **eAPI + RAG high-speed show / state query** (natural language → appropriate show command selected automatically)
+- 🛠️ **eAPI Config (NETCONF-unsupported area config change)** — Covers VXLAN/EVPN and BGP network/redistribute via eAPI configure session. Two-layer safety guard + Phase1 dry-run / Phase2 commit flow
+- 🔎 **Snapshot-diff RAG fault diagnosis** — Saves normal-state eAPI output and injects Unified Diff into LLM context at diagnosis time. Five specialist agents (flow routing / L2 / L3 / consistency check / report) collaborate with automatic Self-Correction
 - ✅ **ANTA auto Post-Check** (~340 ms / 11 tests after deploy — zero side-effects verified automatically)
 - 🛡️ **XDP/eBPF AI control** (Human-in-the-loop — AI proposes, human approves before XDP rule is applied)
-- ⚡ **Groq → Azure OpenAI automatic fallback** (shared across all 5 servers; swap LLM with a single file change)
+- ⚡ **Groq → Azure OpenAI automatic fallback** (shared across all servers; swap LLM with a single file change)
 
 ---
 
@@ -56,7 +60,7 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 │  │  app_a2a.py (NiceGUI Web UI / port:8080)       │  │
 │  │  · Natural language input → REST POST /execute │  │
 │  │  · Dry-run → Diff review → Approve & Deploy    │  │
-│  │  · ANTA Verify tab / Security tab              │  │
+│  │  · ANTA Verify / Diagnose / Security tab       │  │
 │  │  · i18n support (Japanese / English)           │  │
 │  └────────────────────┬───────────────────────────┘  │
 └───────────────────────│─────────────────────────────┘
@@ -67,27 +71,39 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 │  ┌─────────────────────────────────────────────┐    │
 │  │  task_decompose_a2a_server.py  :8000         │    │
 │  │  A2A Hub / LLM Router                        │    │
-│  │  write  → :8001  / read    → :8002           │    │
-│  │  security → :8003 / verify → :8004           │    │
-│  └────┬──────────┬──────────┬──────────┬───────┘    │
-│       │          │          │          │             │
-│  ┌────▼──┐  ┌────▼──┐  ┌───▼───┐  ┌───▼───┐        │
-│  │:8001  │  │:8002  │  │:8003  │  │:8004  │        │
-│  │NETCONF│  │eAPI   │  │XDP    │  │ANTA   │        │
-│  │RAG    │  │Show + │  │Firewall│  │Verify │        │
-│  │(cfg)  │  │Diff   │  │(eBPF) │  │(test) │        │
-│  └───┬───┘  └───┬───┘  └───┬───┘  └───┬───┘        │
-│      │          │          │          │             │
-│  ┌───▼──────────▼──┐  ┌────▼──────────▼──────┐      │
-│  │  Arista cEOS    │  │ Go IPS REST API :8080 │      │
-│  │  (NETCONF/eAPI) │  │ (ips-maf eBPF/XDP)   │      │
-│  └─────────────────┘  └──────────────────────┘      │
+│  │  write  → :8001  / read      → :8002         │    │
+│  │  security → :8003 / verify   → :8004         │    │
+│  │  eapi_config → :8006 (VXLAN/EVPN・BGP CLI)  │    │
+│  └────┬──────────┬──────────┬──────────┬───┬───┘    │
+│       │          │          │          │   │         │
+│  ┌────▼──┐  ┌────▼──┐  ┌───▼───┐  ┌───▼─┐ │        │
+│  │:8001  │  │:8002  │  │:8003  │  │:8004│ │        │
+│  │NETCONF│  │eAPI   │  │XDP    │  │ANTA │ │        │
+│  │RAG    │  │Show + │  │Firewall│  │Verify│ │        │
+│  │(cfg)  │  │Diff   │  │(eBPF) │  │(test)│ │        │
+│  └───┬───┘  └───┬───┘  └───┬───┘  └──┬──┘ │        │
+│      │          │          │         │    │         │
+│  ┌───▼──────────▼──┐  ┌────▼─────────▼──┐ │        │
+│  │  Arista cEOS    │  │ Go IPS REST API  │ │        │
+│  │  (NETCONF/eAPI) │  │ :8080 (eBPF/XDP) │ │        │
+│  └─────────────────┘  └─────────────────┘ │        │
+│                                            │        │
+│  ┌─────────────┐  ┌──────────────────────┐ │        │
+│  │:8005        │  │:8006                 │◀┘        │
+│  │Diagnose     │  │eAPI Config           │          │
+│  │(5 agents)   │  │(VXLAN/EVPN・BGP CLI)  │          │
+│  └──────┬──────┘  └──────────┬───────────┘          │
+│         │                    │                      │
+│  ┌──────▼────────────────────▼──┐                   │
+│  │  Arista cEOS (eAPI / HTTPS)  │                   │
+│  └──────────────────────────────┘                   │
 └─────────────────────────────────────────────────────┘
 ```
 
 > **Communication path note**
-> Security tab real-time display (Top Traffic / Drop List / QoS List) polls Go IPS (:8080) **directly** from the Web UI — bypassing the A2A Hub.
-> Security operations triggered via chat go through Hub → XDP Agent (:8003) → Go IPS as usual.
+> - Security tab real-time display (Top Traffic / Drop List / QoS List) polls Go IPS (:8080) **directly** from the Web UI — bypassing the A2A Hub.
+> - Diagnose tab sends A2A requests **directly** from the Web UI to Diagnose Agent (:8005) — bypassing the A2A Hub.
+> - Security operations and VXLAN/EVPN config changes and BGP network/redistribute triggered via chat go through Hub → respective agent as usual.
 
 ### Azure components
 
@@ -99,10 +115,12 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 | eAPI Agent | Azure VM | State query + Diff engine (port:8002) |
 | XDP Agent | Azure VM | Security control (port:8003) |
 | ANTA Agent | Azure VM | Post-verification (port:8004) |
+| Diagnose Agent | Azure VM | Fault diagnosis (5-agent collaboration) (port:8005) |
+| eAPI Config Agent | Azure VM | VXLAN/EVPN and BGP network/redistribute — NETCONF-unsupported areas via eAPI configure session (port:8006) |
 | Go IPS | Azure VM | eBPF/XDP REST API (port:8080). Attaches XDP/eBPF to ceos1 eth2 via `-iface eth2` |
 | LLM Primary | Groq | llama-3.3-70b-versatile (low-latency inference) |
 | LLM Fallback | Azure OpenAI | gpt-4.1-mini (private endpoint) |
-| Agent framework | **Microsoft Agent Framework** | LLM client layer for NETCONF Agent |
+| Agent framework | **Microsoft Agent Framework** | LLM client for NETCONF Agent + 5-agent framework for Diagnose Agent (6 Agent instances total) |
 
 ---
 
@@ -112,23 +130,37 @@ Nothing touches the device until you press **Approve**. Hit **Cancel** and the s
 Natural language query
       │
       ▼
-┌─────────────────────────────────────┐
-│    classify_query()                  │
-│                                     │
-│  ① VERIFY_KEYWORDS match?          │
-│     → "verify"  ──────────────────▶ ANTA Agent   :8004
-│                                     │
-│  ② SECURITY_REQUIRED match?        │
-│     → "security" ─────────────────▶ XDP Agent    :8003
-│                                     │
-│  ③ READ_KEYWORDS only?             │
-│     → "read"   ────────────────────▶ eAPI Agent  :8002
-│                                     │
-│  ④ WRITE_KEYWORDS only?            │
-│     → "write"  ────────────────────▶ NETCONF Agent :8001
-│                                     │
-│  ⑤ Ambiguous → LLM fallback       │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│    classify_query()                                  │
+│                                                     │
+│  ⓪ VXLAN/EVPN × config change (no read verb)?     │
+│     → "eapi_config" ──────────────────────────────▶ eAPI Config Agent :8006
+│                                                     │
+│     VXLAN/EVPN × read verb present?                │
+│     → "read"   ───────────────────────────────────▶ eAPI Agent :8002
+│                                                     │
+│     BGP network / redistribute / advertise?         │
+│     → "eapi_config" ──────────────────────────────▶ eAPI Config Agent :8006
+│                                                     │
+│  ① VERIFY_KEYWORDS match?                          │
+│     → "verify"  ──────────────────────────────────▶ ANTA Agent   :8004
+│                                                     │
+│  ② SECURITY_REQUIRED match?                        │
+│     → "security" ─────────────────────────────────▶ XDP Agent    :8003
+│                                                     │
+│  ③ READ_KEYWORDS only?                             │
+│     → "read"   ────────────────────────────────────▶ eAPI Agent  :8002
+│                                                     │
+│  ④ WRITE_KEYWORDS only?                            │
+│     → "write"  ────────────────────────────────────▶ NETCONF Agent :8001
+│                                                     │
+│  ④ read + write mixed? → "mixed"                  │
+│     → execute read only + show warning bubble      │
+│                                                     │
+│  ⑤ Ambiguous → LLM fallback                       │
+└─────────────────────────────────────────────────────┘
+
+Note: Diagnose Agent (:8005) is called directly from the Web UI, bypassing the Hub.
 ```
 
 ---
@@ -143,6 +175,10 @@ Natural language query
 | `arista_eapi_show_a2a_server.py` | eAPI Agent / Diff engine (port:8002) |
 | `xdp_a2a_server.py` | XDP Agent / Security control (port:8003) |
 | `arista_anta_verify_a2a_server.py` | ANTA Agent / Post-verification (port:8004) |
+| `diagnose_a2a_server.py` | Diagnose Agent / Fault diagnosis (port:8005) |
+| `arista_eapi_config_a2a_server.py` | eAPI Config Agent / VXLAN/EVPN and BGP network/redistribute — NETCONF-unsupported areas (port:8006) |
+| `snapshot_manager.py` | Snapshot manager (for Diagnose Agent) |
+| `diff_engine.py` | Diff extraction engine (for Diagnose Agent) |
 | `llm_factory.py` | Shared LLM factory (Groq Primary / Azure OpenAI Fallback) |
 | `i18n.py` | Internationalization (Japanese / English) |
 | `config.ini.example` | Configuration file sample |
@@ -188,11 +224,13 @@ cp config.ini.example config.ini
 
 ```bash
 # Launch A2A agents (on Azure VM)
-python task_decompose_a2a_server.py &      # A2A Hub       :8000
-python arista_netconf_rag_a2a_server.py &  # NETCONF Agent :8001
-python arista_eapi_show_a2a_server.py &    # eAPI Agent    :8002
-python xdp_a2a_server.py &                # XDP Agent     :8003
-python arista_anta_verify_a2a_server.py &  # ANTA Agent    :8004
+python task_decompose_a2a_server.py &       # A2A Hub        :8000
+python arista_netconf_rag_a2a_server.py &   # NETCONF Agent  :8001
+python arista_eapi_show_a2a_server.py &     # eAPI Agent     :8002
+python xdp_a2a_server.py &                 # XDP Agent      :8003
+python arista_anta_verify_a2a_server.py &   # ANTA Agent     :8004
+python diagnose_a2a_server.py &             # Diagnose Agent :8005
+python arista_eapi_config_a2a_server.py &   # eAPI Config    :8006
 
 # Launch Web UI (on Azure Container Apps)
 python app_a2a.py
@@ -339,7 +377,7 @@ The NETCONF RAG includes **real-hardware-verified XML templates** as a 4th knowl
 
 ### Microsoft Agent Framework
 
-`agent_framework_openai.OpenAIChatCompletionClient` is used as the LLM client for the NETCONF Agent. It abstracts Groq and Azure OpenAI behind a single interface and automatically falls back on failure.
+`agent_framework_openai.OpenAIChatCompletionClient` is used in 2 servers: NETCONF Agent (XML generation) and Diagnose Agent (5-agent construction). It abstracts Groq and Azure OpenAI behind a single interface and automatically falls back on failure. 6 Agent instances in total are built with Microsoft Agent Framework (NETCONF Agent: 1, Diagnose Agent: 5).
 
 ```python
 from agent_framework_openai import OpenAIChatCompletionClient
@@ -350,6 +388,21 @@ client = OpenAIChatCompletionClient(
     base_url= GROQ_BASE_URL,
 )
 ```
+
+### eAPI configure session limit handling (eAPI Config Agent)
+
+If sessions are left open after dry-run, the `configure session` limit is reached. Phase1 always calls `abort` immediately after fetching `show session-config diffs` to discard the session. Phase2 (commit) generates a new timestamped session name (`eapi_config_YYYYMMDD_HHMMSS`) and never reuses the Phase1 session name.
+
+```
+Phase1 (dry-run): configure session → show diffs → abort  ← session discarded immediately
+Phase2 (commit):  new session name  → configure session → commit
+```
+
+### Snapshot-diff RAG (Diagnose Agent)
+
+Normal-state eAPI output is saved as JSON (`snapshot_manager.py`). At diagnosis time, `difflib` generates a Unified Diff which is injected into the LLM context (`diff_engine.py`). Implemented with no vector DB and no extra libraries (Python standard library only).
+
+Five specialist agents (flow routing / L2 analysis / L3 analysis / consistency check / diagnostic report) collaborate. When the consistency-check agent detects a conflict, the L3 agent automatically re-analyzes (Self-Correction).
 
 </details>
 

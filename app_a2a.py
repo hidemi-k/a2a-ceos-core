@@ -82,9 +82,9 @@ _UI_MSG = {
         "diff_label": "① 設定差分",
         "reasoning_label": "② AI の判断根拠 (Reasoning)",
         "logs_label": "③ 技術ログ (NETCONF / Raw)",
-        "confirm_btn": "✓  内容を確認しました。本番適用します",
+        "confirm_btn": "✓  承認 & Commit",
         "deploy_diff": "Deploy Diff (Audit)",
-        "hint_input": "例: BGPの状態を調べて",
+        "hint_input": "例: OSバージョン情報を教えて",
         "hint_guide": "自然言語でネットワーク操作を入力してください。Dry-run → Diff 確認 → 承認 の順で実行されます。",
         "diff_tab_confirm": "Diff / Historyタブで確認",
         "error_title": "エラーが発生しました",
@@ -2208,7 +2208,47 @@ def main():
                                 set_phase("idle")
                                 asyncio.create_task(scroll_to_bottom())  # レスポンス表示後にスクロール
 
-                            # ── WRITE 系 dry-run OFF: そのまま表示 ───────────
+                                # ── mixed クエリ警告バブル ──────────────────
+                                # 参照と設定変更が混在していた場合、参照結果の直後に
+                                # 警告を表示する（Diff/History 遷移なし）。
+                                _mixed_warn = raw.get("mixed_warning", "")
+                                if _mixed_warn:
+                                    with chat_col:
+                                        with ui.row().style(
+                                            "justify-content:flex-start;width:100%;margin:2px 0;"
+                                        ):
+                                            with ui.column().style(
+                                                "gap:3px;max-width:min(94%, 100%);"
+                                            ):
+                                                with ui.row().style(
+                                                    "align-items:center;gap:6px;"
+                                                ):
+                                                    ui.label(
+                                                        f"agent · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                                                    ).style(
+                                                        f"font-size:10px;color:{C['text3']};"
+                                                    )
+                                                    badge("⚠️ 警告", "dry-run")
+                                                with ui.card().style(
+                                                    f"background:{C['warn_bg']};"
+                                                    f"border:0.5px solid {C['warn_fg']}66;"
+                                                    "border-radius:2px 12px 12px 12px;"
+                                                    "padding:11px 14px;gap:4px;box-shadow:none;"
+                                                ):
+                                                    _warn_esc = (
+                                                        _mixed_warn
+                                                        .replace("&", "&amp;")
+                                                        .replace("<", "&lt;")
+                                                        .replace(">", "&gt;")
+                                                    )
+                                                    ui.html(
+                                                        f'<div style="font-size:12px;'
+                                                        f'color:{C["warn_fg"]};'
+                                                        f'white-space:pre-wrap;'
+                                                        f'line-height:1.6;">'
+                                                        + _warn_esc + "</div>"
+                                                    )
+                                    asyncio.create_task(scroll_to_bottom())
                             else:
                                 # dry_run / no_changes / skipped も正常扱い
                                 _ok_statuses = ("success", "dry_run", "no_changes", "all_success")
@@ -2272,7 +2312,15 @@ def main():
                                     h["task_summaries"]   = p["task_summaries"]
                                     break
 
-                            # タスク結果の詳細を表示
+                            # eAPI Config 承認待ちリストから削除 + Diff/History 再描画
+                            # ★ create_task で遅延: _do_deploy_api は chat_col コンテキスト内で
+                            #    動いているため同期で render_diff_tab() を呼ぶと
+                            #    diff_body への操作と競合し NiceGUI エラーが発生する。
+                            _tid_to_pop = state.trace_id
+                            async def _deferred_refresh(tid=_tid_to_pop):
+                                _eapi_cfg_pending.pop(tid, None)
+                                render_diff_tab()
+                            asyncio.create_task(_deferred_refresh())
                             task_detail = ""
                             for ts in p["task_summaries"]:
                                 ds = ts.get("deploy_status", "")
@@ -2653,48 +2701,27 @@ def main():
                                                 f"margin:6px 0;background:{C['border']};"
                                             )
                                             def _make_eapi_approve_diff(tid, ent):
-                                                async def _approve():
-                                                    try:
-                                                        _r = await api_post(
-                                                            f"/deploy/{tid}", _deploy_payload()
-                                                        )
-                                                        _ok = (_r.get("status") == "success")
-                                                        ent["deployed"]      = _ok
-                                                        ent["deploy_status"] = _r.get("status")
-                                                        _eapi_cfg_pending.pop(tid, None)
-                                                        render_diff_tab()
-                                                        ui.notify(
-                                                            L("eapi_cfg_success") if _ok
-                                                            else f"❌ Commit 失敗: {_r.get('status')}",
-                                                            color="positive" if _ok else "negative",
-                                                        )
-                                                    except Exception as _e:
-                                                        _err = str(_e)
-                                                        if "parent element" not in _err and "slot" not in _err:
-                                                            ui.notify(f"❌ Commit エラー: {_err}", type="negative")
+                                                def _approve():
+                                                    # ★ NETCONF と完全に同じフロー:
+                                                    #    state.trace_id を tid にセット →
+                                                    #    show_approve_dialog → _do_deploy_api()
+                                                    #    (_do_deploy_api 内の create_task で
+                                                    #     render_diff_tab + _eapi_cfg_pending.pop
+                                                    #     が遅延実行されボタンが自動消去される)
+                                                    state.trace_id = tid
+                                                    show_approve_dialog(
+                                                        trace_id=tid,
+                                                        on_deploy=_do_deploy_api,
+                                                    )
                                                 return _approve
-                                            with ui.row().style(
-                                                "gap:10px;align-items:center;width:100%;"
-                                            ):
-                                                ui.label(
-                                                    "差分を確認してください。承認すると running-config に commit されます。"
-                                                ).style(
-                                                    f"font-size:11px;color:{C['text2']};flex:1;"
-                                                )
-                                                ui.button(
-                                                    L("eapi_cfg_commit"), icon="check_circle"
-                                                ).style(
-                                                    f"font-size:12px;font-weight:600;"
-                                                    f"background:{C['success_bg']};color:{C['success_fg']};"
-                                                    f"border:0.5px solid {C['success_fg']}66;"
-                                                    "border-radius:6px;padding:4px 16px;min-height:32px;"
-                                                ).on("click", _make_eapi_approve_diff(_ec_tid, entry))
-
-                                        # Commit 完了表示
-                                        if _ec_deployed:
-                                            ui.label("✅ eAPI configure session commit 完了").style(
-                                                f"font-size:11px;color:{C['success_fg']};"
-                                            )
+                                            # ★ NETCONF の confirm_btn と同じ全幅スタイルに統一
+                                            ui.button(L("eapi_cfg_commit")).style(
+                                                f"width:100%;padding:10px;"
+                                                "font-size:13px;font-weight:500;"
+                                                f"background:{C['success_bg']};color:{C['success_fg']};"
+                                                f"border:0.5px solid {C['success_fg']}66;"
+                                                "border-radius:6px;margin-top:2px;"
+                                            ).on("click", _make_eapi_approve_diff(_ec_tid, entry))
                                     continue   # NETCONF 履歴の表示ロジックをスキップ
 
                                 # ── NETCONF / 既存エントリ ──────────────────────────
@@ -3601,8 +3628,8 @@ def main():
                                  "L3 診断",          "BGP / ルーティング / ARP"),
                                 ("l2",  "cable",
                                  "L2 診断",          "インターフェース / MAC"),
-                                ("l3",  "hub",
-                                 "BGP 診断",         "BGP 特化 · EVPN 含む"),
+                                ("bgp",  "hub",
+                                 "BGP 診断",         "BGP 特化 · VXLAN / EVPN 含む"),
                             ]:
                                 with ui.card().style(
                                     f"padding:10px 12px;cursor:pointer;width:100%;"

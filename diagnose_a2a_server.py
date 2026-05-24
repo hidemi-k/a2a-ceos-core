@@ -52,7 +52,7 @@ diagnose A2A Server — マルチエージェント障害診断 (port:8005)
 【環境変数】
   A2A_PORT       : このサーバのポート（デフォルト: 8005）
   EAPI_HOST      : デバイスIP（デフォルト: 172.20.100.31）
-  EAPI_PORT_NUM  : eAPI ポート番号（デフォルト: 443）
+  EAPI_PORT  : eAPI ポート番号（デフォルト: 443）
   EAPI_TRANSPORT : eAPI トランスポート（デフォルト: https）
   EAPI_USER      : eAPI ユーザー名（デフォルト: admin）
   EAPI_PASS      : eAPI パスワード（デフォルト: admin）
@@ -150,7 +150,7 @@ A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 
 # eAPI 接続設定（arista_eapi_show_a2a_server.py と同じ環境変数）
 DEFAULT_EAPI_HOST      = os.getenv("EAPI_HOST",      "172.20.100.31")
-DEFAULT_EAPI_PORT      = int(os.getenv("EAPI_PORT_NUM", "443"))
+DEFAULT_EAPI_PORT      = int(os.getenv("EAPI_PORT", "443"))
 DEFAULT_EAPI_TRANSPORT = os.getenv("EAPI_TRANSPORT", "https")
 DEFAULT_EAPI_USER      = os.getenv("EAPI_USER",      "admin")
 DEFAULT_EAPI_PASS      = os.getenv("EAPI_PASS",      "admin")
@@ -193,6 +193,13 @@ VENDOR_COMMANDS: Dict[str, Dict] = {
                     "注目点: 特定 VLAN のエントリ欠落、エントリ数が異常に少ない。"
                 ),
             },
+            {
+                "cmd": "show vlan",
+                "purpose": (
+                    "設定済み VLAN の一覧と状態を確認する。"
+                    "注目点: 期待する VLAN ID が存在しない、Status が active でない。"
+                ),
+            },
         ],
         "l3": [
             {
@@ -231,6 +238,28 @@ VENDOR_COMMANDS: Dict[str, Dict] = {
                     "ネイバーが期待数より少ない。"
                 ),
             },
+            {
+                "cmd": "show vxlan vni",
+                "purpose": (
+                    "VXLAN VNI マッピング（VLAN ↔ VNI）の設定状態を確認する。"
+                    "注目点: 期待する VLAN に VNI が割り当てられていない、"
+                    "Source が static でない（EVPN 動的学習の確認）。"
+                ),
+            },
+            {
+                "cmd": "show vxlan flood vtep",
+                "purpose": (
+                    "VXLAN フラッディング先 VTEP の一覧を確認する。"
+                    "注目点: 期待する VTEP IP が登録されていない（BUM トラフィック転送不可）。"
+                ),
+            },
+            {
+                "cmd": "show bgp evpn summary",
+                "purpose": (
+                    "EVPN BGP ピアの状態・NLRI 受信数を確認する。"
+                    "注目点: ピアが Established でない、NLRI 受信数が 0（MAC/IP 経路未学習）。"
+                ),
+            },
         ],
         "recovery_hints": {
             "interface_down":  "interface {ifname} → no shutdown",
@@ -240,6 +269,8 @@ VENDOR_COMMANDS: Dict[str, Dict] = {
             "route_missing":   "show ip route {prefix} → 再配送設定・ルートマップを確認",
             "arp_incomplete":  "ping {ip} source {src_if} → clear arp-cache でARPキャッシュをクリア",
             "ospf_down":       "show ip ospf interface → インターフェースの OSPF 設定確認",
+            "vxlan_vni_missing": "interface Vxlan1 → vxlan vlan {vlan} vni {vni} で VNI マッピングを確認",
+            "evpn_peer_down":  "show bgp evpn neighbors {peer} detail → clear bgp evpn {peer} soft",
         },
     },
 
@@ -659,7 +690,7 @@ class NetworkDiagnosticSystem:
         logger.info("=" * 60)
 
         # ── Step 0: LLM がフロー遷移を判断 ─────────────────────────────────
-        if forced_flow and forced_flow in ("l2", "l3", "full"):
+        if forced_flow and forced_flow in ("l2", "l3", "full", "bgp"):
             flow = forced_flow
             logger.info(f"Step 0: フロー強制指定 → [{flow}]")
         else:
@@ -668,15 +699,16 @@ class NetworkDiagnosticSystem:
                 f"以下の状況に対して診断フローを選択してください。\n\n{user_input}"
             )
             flow_raw = _extract_text(resp).strip().lower().split()[0]
-            flow = flow_raw if flow_raw in ("l2", "l3", "full") else "full"
+            flow = flow_raw if flow_raw in ("l2", "l3", "full", "bgp") else "full"
             logger.info(f"  → 選択フロー: [{flow}]")
 
         result["flow"] = flow
 
         # ── Step 1: YAML辞書からコマンドを取得して eAPI で実行 ──────────────
         logger.info(f"Step 1: コマンド実行（eAPI / {os_label}）")
+        # bgp フロー: VXLAN/EVPN を含む l3 コマンド全体を実行
         l2_entries = vendor_cfg["l2"] if flow in ("l2", "full") else []
-        l3_entries = vendor_cfg["l3"] if flow in ("l3", "full") else []
+        l3_entries = vendor_cfg["l3"] if flow in ("l3", "full", "bgp") else []
         all_entries = l2_entries + l3_entries
         all_cmds    = [e["cmd"] for e in all_entries]
 
@@ -829,7 +861,7 @@ class NetworkDiagnosticExecutor(AgentExecutor):
         entries: List[Dict] = []
         if flow in ("l2", "full"):
             entries += vendor_cfg["l2"]
-        if flow in ("l3", "full"):
+        if flow in ("l3", "full", "bgp"):
             entries += vendor_cfg["l3"]
 
         cmds        = [e["cmd"] for e in entries]
@@ -915,7 +947,7 @@ class NetworkDiagnosticExecutor(AgentExecutor):
             else:
                 query       = params.get("query", raw_text)
                 forced_flow = params.get("flow", None)
-                if forced_flow and forced_flow not in ("l2", "l3", "full"):
+                if forced_flow and forced_flow not in ("l2", "l3", "full", "bgp"):
                     forced_flow = None
 
                 logger.info(

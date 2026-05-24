@@ -16,7 +16,7 @@ FastAPI エンドポイント（NiceGUI UI 向け）:
   WS   /ws/updates           ログストリーミング
 
 起動:
-  python task_decompose_a2a_server_v2.py
+  python task_decompose_a2a_server.py
 
 環境変数:
   A2A_PORT       : このサーバのポート（デフォルト: 8000）
@@ -203,17 +203,41 @@ def classify_query(query: str) -> str:
 
     # 0. VXLAN/EVPN × 設定変更 → eapi_config（最優先）
     #    NETCONF/OpenConfig では設定不可のため eAPI configure session で処理する
+    #
+    #    ★ 参照系動詞（READ_KEYWORDS）が含まれる場合は eapi_config へ送らず read に倒す。
+    #       例: "VXLANの設定を確認して" → "設定"(write_verb) + "確認"(read_verb)
+    #           → 参照系が優先 → eapi_show へ
+    #       例: "VXLAN VNI 100 に vni 10000 を設定して" → write_verb のみ → eapi_config
     _has_vxlan_evpn = any(k in q for k in [
         "vxlan", "evpn", "vni", "vtep", "route-target",
         "ルートターゲット", "mac flooding", "mac フラッディング",
         "address-family evpn", "evpn アドレスファミリー",
     ])
+    # ★ BGP network advertise / redistribute も eapi_config へ
+    # NETCONF の BGP YANG は複数ツリーをまたぐ複雑な操作のため CLI 方式が確実
+    _has_bgp_cli = (
+        any(k in q for k in ["bgp", "ルータ bgp", "router bgp"])
+        and any(k in q for k in [
+            "network ", "redistribute", "advertise", "アドバタイズ",
+            "bgp network", "bgp advertise",
+        ])
+    )
     _has_write_verb = any(k in q for k in [
-        "設定", "変更", "追加", "適用", "投入", "作成", "修正",
-        "configure", "set", "add", "update", "apply", "create",
+        "設定", "変更", "追加", "削除", "適用", "投入", "作成", "修正",
+        "configure", "set", "add", "delete", "remove", "update", "apply", "create",
     ])
-    if _has_vxlan_evpn and _has_write_verb:
+    _has_read_verb = any(k in q for k in READ_KEYWORDS)
+    if (_has_vxlan_evpn and _has_write_verb and not _has_read_verb):
         return "eapi_config"
+    # BGP network/redistribute/advertise は write_verb なしでも eapi_config へ
+    # （「redistribute connected して」の「して」は write_verb にヒットしないため）
+    if _has_bgp_cli and not _has_read_verb:
+        return "eapi_config"
+    # VXLAN/EVPN + 参照系動詞 → read（設定変更ではなく状態確認）
+    # 例: "VXLANの設定を確認して" → read（eapi_show へ）
+    # ※ mixed に落ちないよう、ここで明示的に read を返す
+    if _has_vxlan_evpn and _has_read_verb:
+        return "read"
 
     # 1. ANTA 検証を最優先
     if any(k in q for k in VERIFY_KEYWORDS):
@@ -259,7 +283,7 @@ def classify_query(query: str) -> str:
 
     if has_read and not has_write:  return "read"
     if has_write and not has_read:  return "write"
-    if has_read and has_write:      return "read"   # 競合時は参照を優先
+    if has_read and has_write:      return "mixed"  # 参照+変更の混在 → UI で警告
 
     # 4. 脅威系のみ（READ/WRITE どちらもなし）→ security
     if any(k in q for k in SECURITY_CONTEXT_KEYWORDS):
@@ -562,11 +586,57 @@ async def execute(req: ExecuteRequest):
     route    = classify_query(req.query)
     logger.info(f"[{trace_id}] /execute: {req.query!r} route={route}")
 
+    # ── VLAN名のみ削除ガード ──────────────────────────────────────────────────
+    # ネットワーク運用の原則: VLAN操作はVLAN IDで行う（名前は一意でないため危険）。
+    # 削除系クエリで VLAN IDの数値が含まれず、VLAN名のみ指定されている場合は
+    # バックエンドに転送せず即エラーを返す。
+    _delete_verbs    = ["削除", "delete", "remove", "消し", "消す", "なくし"]
+    _q_lower         = req.query.lower()
+    _has_delete      = any(k in _q_lower for k in _delete_verbs)
+    _has_vlan_kw     = "vlan" in _q_lower
+    _has_vlan_id     = bool(re.search(r'\b\d+\b', req.query))
+    if route == "write" and _has_delete and _has_vlan_kw and not _has_vlan_id:
+        msg = (
+            "VLAN削除にはVLAN IDの指定が必要です。\n"
+            "VLAN名からの自動解決は行いません（名前は一意でないため危険）。\n"
+            "例: 'VLAN 102 を削除して' のようにVLAN IDで指定してください。"
+        )
+        logger.warning(f"[{trace_id}] VLAN名のみ削除をブロック: {req.query!r}")
+        error_response = {
+            "trace_id":       trace_id,
+            "route":          "write",
+            "is_read":        False,
+            "status":         "blocked",
+            "overall_status": "blocked",
+            "summary":        msg,
+            "xml":            "",
+            "session_diff":   {},
+            "task_summaries": [{
+                "task_id":       "task_1",
+                "operation":     "delete_vlan",
+                "target":        req.query,
+                "deploy_status": "blocked",
+                "audit_message": msg,
+            }],
+        }
+        _trace_store[trace_id] = {
+            **error_response,
+            "device":      req.device.model_dump(),
+            "query":       req.query,
+            "is_read":     False,
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        from fastapi.responses import Response as _VlanErrResp
+        return _VlanErrResp(
+            content=json.dumps(error_response, ensure_ascii=True),
+            media_type="application/json",
+        )
+
     is_read = (route == "read")
     # eAPI と NETCONF でポートを使い分ける
     # eAPI: HTTPS/443（実機確認済み。NETCONF port 830 を渡すと SSL エラーになる）
     # NETCONF: req.device.port をそのまま使う（デフォルト 830）
-    EAPI_DEFAULT_PORT = int(os.getenv("EAPI_PORT_NUM", "443"))
+    EAPI_DEFAULT_PORT = int(os.getenv("EAPI_PORT", "443"))
     payload = {
         "query":     req.query,
         "device_ip": req.device.ip,
@@ -617,6 +687,54 @@ async def execute(req: ExecuteRequest):
         }
         from fastapi.responses import Response
         return Response(
+            content=json.dumps(response, ensure_ascii=True),
+            media_type="application/json",
+        )
+
+    # ── mixed ルート: 参照+変更の混在クエリ → eAPI で参照だけ実行して警告 ───────
+    # 設定変更は実行せず参照結果のみ返す。UI 側で警告バブルを追加表示する。
+    if route == "mixed":
+        _warn_msg = (
+            "⚠️ 参照と設定変更が混在しています。\n"
+            "参照結果のみ表示しました。設定変更は別途入力してください。\n"
+            "例: まず「VLANの状態を確認して」→ 次に「VLAN ID 103 の DEV3_VLAN を作成して」"
+        )
+        logger.info(f"[{trace_id}] mixed クエリ検出: 参照のみ実行")
+        mixed_payload = {
+            "query":     req.query,
+            "device_ip": req.device.ip,
+            "username":  req.device.username,
+            "password":  req.device.password,
+            "port":      str(EAPI_DEFAULT_PORT),
+            "deploy":    True,   # eAPI は即時実行
+        }
+        try:
+            mixed_result = await _forward(EAPI_A2A_URL, mixed_payload)
+        except Exception as e:
+            mixed_result = {"status": "error", "message": str(e)}
+
+        response = {
+            "trace_id":      trace_id,
+            "route":         "read",   # UI は read として処理
+            "is_read":       True,
+            "status":        mixed_result.get("status", "unknown"),
+            "summary":       mixed_result.get("summary", ""),
+            "result":        mixed_result,
+            "formatted":     mixed_result.get("formatted_text",
+                             mixed_result.get("formatted", "")),
+            "xml":           "",
+            "session_diff":  {},
+            "mixed_warning": _warn_msg,   # ★ UI が警告バブルを表示するフラグ
+        }
+        _trace_store[trace_id] = {
+            **response,
+            "device":      req.device.model_dump(),
+            "query":       req.query,
+            "is_read":     True,
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        from fastapi.responses import Response as _MixedResp
+        return _MixedResp(
             content=json.dumps(response, ensure_ascii=True),
             media_type="application/json",
         )
@@ -790,8 +908,8 @@ async def execute(req: ExecuteRequest):
         # running-config は変更しない（abort 保証）。
         if xml_out:
             EAPI_DIRECT_URL = os.getenv("EAPI_DIRECT_URL",
-                                         f"http://localhost:{os.getenv('EAPI_PORT','8002')}")
-            EAPI_DIFF_PORT  = int(os.getenv("EAPI_PORT_NUM", "443"))
+                                         f"http://localhost:{os.getenv('EAPI_A2A_PORT','8002')}")
+            EAPI_DIFF_PORT  = int(os.getenv("EAPI_PORT", "443"))
             EAPI_TRANSPORT  = os.getenv("EAPI_TRANSPORT", "https")
 
             try:
@@ -1027,6 +1145,17 @@ async def deploy(trace_id: str, req: DeployRequest):
         _trace_store[trace_id]["deployed_at"]   = datetime.now(timezone.utc).isoformat()
         await _push_log(trace_id, f"eAPI Config commit 完了: {status}")
         logger.info(f"[{trace_id}] eAPI Config /deploy 完了: status={status}")
+
+        # ── CNV 自動 Post-Check（eAPI Config も NETCONF と同じく実行）────────
+        snap_id   = req.snapshot_id.strip()
+        deploy_ok = (status == "success")
+        if snap_id and deploy_ok:
+            asyncio.create_task(_auto_post_check(trace_id, snap_id, req.device))
+            response["anta_post_check"] = "running"
+            logger.info(f"[{trace_id}] CNV(eAPI Config): Post-Check タスク起動 snap_id={snap_id!r}")
+        else:
+            response["anta_post_check"] = "skipped"
+
         from fastapi.responses import Response as _ECFR
         return _ECFR(
             content=json.dumps(response, ensure_ascii=True),

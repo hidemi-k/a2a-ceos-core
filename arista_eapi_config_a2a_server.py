@@ -64,7 +64,7 @@ arista_eapi_config_a2a_server.py — eAPI configure session 設定変更 (port:8
 【環境変数】
   A2A_PORT       : このサーバのポート（デフォルト: 8006）
   EAPI_HOST      : デバイスIP（デフォルト: 172.20.100.31）
-  EAPI_PORT_NUM  : eAPI ポート番号（デフォルト: 443）
+  EAPI_PORT  : eAPI ポート番号（デフォルト: 443）
   EAPI_TRANSPORT : eAPI トランスポート（デフォルト: https）
   EAPI_USER      : eAPI ユーザー名（デフォルト: admin）
   EAPI_PASS      : eAPI パスワード（デフォルト: admin）
@@ -148,7 +148,7 @@ A2A_PUBLIC_URL = os.getenv("A2A_PUBLIC_URL", f"http://localhost:{A2A_PORT}")
 
 # eAPI 接続設定（arista_eapi_show_a2a_server.py と同じ環境変数）
 EAPI_HOST      = os.getenv("EAPI_HOST",      "172.20.100.31")
-EAPI_PORT      = int(os.getenv("EAPI_PORT_NUM", "443"))
+EAPI_PORT      = int(os.getenv("EAPI_PORT", "443"))
 EAPI_TRANSPORT = os.getenv("EAPI_TRANSPORT", "https")
 EAPI_USER      = os.getenv("EAPI_USER",      "admin")
 EAPI_PASS      = os.getenv("EAPI_PASS",      "admin")
@@ -511,6 +511,18 @@ JSON 配列のみを出力してください。説明文・コードブロック
         neighbor <PEER> activate
 
   その他 CLI のみで設定可能な機能も対応する。
+
+  BGP network advertise / redistribute（NETCONF では複数YANGツリーをまたぐため CLI 方式で対応）:
+    router bgp <ASN>
+      network <PREFIX>/<LEN>          ← 例: network 192.168.1.0/24
+      redistribute connected          ← connected route を BGP に再配布
+      redistribute static             ← static route を BGP に再配布
+      neighbor <PEER-IP> route-map <MAP-NAME> out  ← route-map 適用
+
+  【BGP network の注意点】
+  - ASN は省略しない。デバイスコンテキストから取得するか、クエリに明示された値を使う
+  - "network" コマンドは "router bgp <ASN>" の配下に記述する
+  - 例: ["router bgp 65001", "network 192.168.1.0/24"]
 
 {device_context}
 
