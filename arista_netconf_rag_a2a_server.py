@@ -1041,6 +1041,22 @@ Input: "DEV8_VLAN を削除したい"
 Output: {"tasks":[{"id":"task_1","operation":"delete_vlan","target":"DEV8_VLAN",
   "yang_path":"/network-instances/network-instance[name=default]/vlans",
   "value":null,"description":"Delete VLAN named DEV8_VLAN (resolve ID from inventory)","depends_on":[]}]}
+
+Input: "BGP neighbor 10.0.20.153 を AS 65003 で追加して"
+Output: {"tasks":[{"id":"task_1","operation":"set_bgp_neighbor","target":"10.0.20.153",
+  "yang_path":"/network-instances/network-instance[name=default]/protocols/protocol[identifier=BGP][name=BGP]/bgp/neighbors/neighbor[neighbor-address=10.0.20.153]",
+  "value":"65003","description":"Add BGP neighbor 10.0.20.153 with peer-AS 65003","depends_on":[]}]}
+
+Input: "BGP neighbor 10.0.20.150 の description を UPLINK-PEER に設定して"
+Output: {"tasks":[{"id":"task_1","operation":"set_bgp_neighbor","target":"10.0.20.150",
+  "yang_path":"/network-instances/network-instance[name=default]/protocols/protocol[identifier=BGP][name=BGP]/bgp/neighbors/neighbor[neighbor-address=10.0.20.150]/config/description",
+  "value":"UPLINK-PEER","description":"Set BGP neighbor 10.0.20.150 description to UPLINK-PEER","depends_on":[]}]}
+
+[IMPORTANT CONSTRAINTS]
+- "value" field MUST be a string or null. NEVER use JSON objects or arrays as value.
+  WRONG: "value": {"peer-as": 65003}
+  RIGHT: "value": "65003"
+- Keep JSON minimal and valid. No trailing commas.
 """
 
 
@@ -1060,12 +1076,44 @@ def decompose_tasks(user_query, llm=None, inventory=None):
         m      = re.search(r"```json\s*(.+?)\s*```", raw, re.DOTALL)
         if m:
             raw = m.group(1).strip()
+        # 余分なテキストを除去して JSON オブジェクトだけ抽出
+        m2 = re.search(r"{.*}", raw, re.DOTALL)
+        if m2:
+            raw = m2.group(0).strip()
+        # ```json``` ブロックがない場合も JSON を抽出
+        if not raw.startswith("{"):
+            m3 = re.search(r"{.*}", raw, re.DOTALL)
+            if m3:
+                raw = m3.group(0).strip()
         parsed = json.loads(raw)
         tasks  = parsed.get("tasks", [])
         return {"status": "success", "tasks": tasks,
                 "message": f"{len(tasks)} task(s)"}
-    except Exception as e:
-        return {"status": "failure", "tasks": [], "message": str(e)}
+    except (json.JSONDecodeError, Exception) as e:
+        # ★ リトライ: LLM に不正 JSON を提示して再生成を要求（最大1回）
+        try:
+            retry_prompt = (
+                TASK_DECOMPOSER_PROMPT
+                + f"\n\nCurrent network state:\n{inv_sect}"
+                + f"\n\nInput: {user_query}\nOutput:"
+                + f"\n\n[RETRY] Previous output was invalid JSON. Error: {e}\n"
+                + "Please output ONLY valid JSON, nothing else:\n"
+            )
+            raw2   = llm.invoke(retry_prompt).content.strip()
+            m4     = re.search(r"```json\s*(.+?)\s*```", raw2, re.DOTALL)
+            if m4:
+                raw2 = m4.group(1).strip()
+            m5 = re.search(r"\{.*\}", raw2, re.DOTALL)
+            if m5:
+                raw2 = m5.group(0).strip()
+            parsed = json.loads(raw2)
+            tasks  = parsed.get("tasks", [])
+            logger.info(f"task_decomposer リトライ成功: {len(tasks)} task(s)")
+            return {"status": "success", "tasks": tasks,
+                    "message": f"{len(tasks)} task(s) (retry)"}
+        except Exception as e2:
+            return {"status": "failure", "tasks": [],
+                    "message": f"{str(e)} / retry: {str(e2)}"}
 
 
 def resolve_dependencies(tasks):

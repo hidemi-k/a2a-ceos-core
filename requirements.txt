@@ -35,6 +35,7 @@ pydantic==2.12.5
 ncclient==0.7.0          # NETCONF（arista_netconf_rag_a2a_server.py）
 pyeapi==1.0.4            # eAPI（arista_eapi_show_a2a_server.py）
 anta==1.8.0              # ANTA Post-Check（arista_anta_verify_a2a_server.py）
+nest_asyncio==1.6.0      # ANTA Post-Check（arista_anta_verify_a2a_server.py）
  
 # ── YAML / 設定ファイル ──────────────────────────────────────
 pyyaml                   # policy_arista.yaml（標準的で変更少ないため上限なし）

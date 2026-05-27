@@ -452,8 +452,19 @@ async def _llm_summarize_diff(diff_text: str, xml_str: str, llm) -> str:
             if not xml_excerpt:
                 return ""
             prompt = f"""以下は Arista EOS への NETCONF 設定変更 XML です。
-承認前の確認用として、「何が追加・変更・削除されるか」を1〜2文の日本語で簡潔に報告してください。
-「〜が追加されます」「〜が削除されます」という形式で、具体的な値（IPアドレス、AS番号等）を含めてください。
+承認前の確認用として、変更内容を1〜2文の日本語で簡潔に報告してください。
+
+【重要な前提】
+- NETCONF の operation 属性がない要素は「新規追加」ではなく「既存設定の上書き（replace/merge）」です
+- BGP neighbor の description 変更など、既存エントリへの属性変更は
+  「追加」ではなく「変更」「更新」「設定」と表現してください
+- operation="delete" がある要素だけを「削除されます」と表現してください
+- operation="create" がある要素のみ「追加されます」と表現してください
+- 具体的な値（IPアドレス、AS番号、VLAN ID、description の値等）を含めてください
+
+例:
+  ✅ 正しい: 「BGP ネイバー 10.0.20.150 の description が UPLINK-PEER に設定されます。」
+  ❌ 誤り:  「BGP プロトコルと、ネイバーとして 10.0.20.150 が追加されます。」
 
 XML:
 {xml_excerpt}
