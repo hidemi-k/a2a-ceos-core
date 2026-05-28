@@ -1623,15 +1623,6 @@ def main():
                             phase_label = ui.label(L("waiting")).style(
                                 f"font-size:11px;color:{C['text3']};"
                             )
-                            dry_run_chk = ui.checkbox(L("dry_run")).style(
-                                f"font-size:12px;color:{C['text']};"
-                            )
-                            dry_run_chk.value = True
-                            ui.label(L("dry_run_active")).style(
-                                f"font-size:10px;background:{C['warn_bg']};"
-                                f"color:{C['warn_fg']};padding:2px 8px;border-radius:4px;"
-                                f"border:0.5px solid {C['warn_fg']}44;"
-                            )
 
                         input_box = ui.input(
                             placeholder=L("hint_input")
@@ -1726,7 +1717,6 @@ def main():
                                     and not is_security
                                     and not is_verify      # ← Verify は承認フロー不要
                                     and not is_eapi_config # ← eAPI Config は専用フローで処理
-                                    and dry_run_chk.value
                                     and (is_dry_run or has_tasks)):
 
                                 # ── mixed: read サブクエリ結果を先に表示 ──────
