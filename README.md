@@ -24,18 +24,10 @@
 
 ---
 
-## Demo & Screenshots
+## Demo
 
-📹 **Demo video coming soon** (replace `VIDEO_ID` once published)
-[![Demo](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=VIDEO_ID)
-
-Nothing touches the device until you press **Approve**. Hit **Cancel** and the session is discarded with zero impact.
-
-<!-- Screenshots (uncomment when ready)
-![Diff tab](docs/screenshots/diff_tab.png)
-![ANTA Post-Check](docs/screenshots/anta_postcheck.png)
-![Security tab](docs/screenshots/security_tab.png)
--->
+📹 **Demo video** (2 min 45 sec)
+[![Demo Video](https://img.youtube.com/vi/tjJTGXttZ-s/maxresdefault.jpg)](https://www.youtube.com/watch?v=tjJTGXttZ-s)
 
 ---
 
