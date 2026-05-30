@@ -24,18 +24,11 @@
 
 ---
 
-## デモ動画・スクリーンショット
+## デモ動画
 
-📹 **動画は近日公開予定です**（公開後は `VIDEO_ID` を差し替えてください）
-[![Demo](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=VIDEO_ID)
+📹 **Demo 動画** (2分45秒)
 
-承認ボタンを押すまで実機には一切触れません。Cancel すれば設定は破棄されます。
-
-<!-- スクリーンショット（準備でき次第、以下を有効化）
-![Diff タブ](docs/screenshots/diff_tab.png)
-![ANTA Post-Check](docs/screenshots/anta_postcheck.png)
-![Security タブ](docs/screenshots/security_tab.png)
--->
+[![Demo Video](https://img.youtube.com/vi/i8RYp8l2jbk/sddefault.jpg)](https://www.youtube.com/watch?v=i8RYp8l2jbk)
 
 ---
 
