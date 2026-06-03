@@ -79,16 +79,20 @@ from i18n import get_msg, locale_from_request, LOCALE
 
 import pyeapi
 
-# A2A SDK
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+# A2A SDK (v1.1.0)
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # LangChain
 from langchain_community.vectorstores import FAISS
@@ -1166,14 +1170,33 @@ class AristaEapiShowExecutor(AgentExecutor):
         return {"query": text}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # v1.1.0: Message を直接 enqueue する（Task より先に TaskStatusUpdateEvent を
+        # 送ってはいけないため、Message 直接送信が最もシンプル）
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text: str) -> "_Message":
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            part = _Part(text=text)
+            msg.parts.append(part)
+            return msg
+
+        async def _send_text(text: str) -> None:
+            await event_queue.enqueue_event(_make_message(text))
+
         raw_text = ""
         for part in context.message.parts:
-            if hasattr(part.root, "text"):
-                raw_text += part.root.text
+            if part.HasField("text"):
+                raw_text += part.text
 
         if not raw_text.strip():
-            await event_queue.enqueue_event(
-                new_agent_text_message("メッセージが空です。"))
+            await _send_text("メッセージが空です。")
             return
 
         params    = self._parse_request(raw_text)
@@ -1195,30 +1218,27 @@ class AristaEapiShowExecutor(AgentExecutor):
             # ② JSON パース
             payload = _parse_payload(response)
             if payload is None:
-                await event_queue.enqueue_event(
-                    new_agent_text_message(json.dumps({
-                        "status": "error",
-                        "message": get_msg("eapi_parse_fail"),
-                        "raw_response": response[:500],
-                    }, ensure_ascii=True, indent=2)))
+                await _send_text(json.dumps({
+                    "status": "error",
+                    "message": get_msg("eapi_parse_fail"),
+                    "raw_response": response[:500],
+                }, ensure_ascii=True, indent=2))
                 return
 
             if _is_error_payload(payload):
-                await event_queue.enqueue_event(
-                    new_agent_text_message(json.dumps({
-                        "status": "error",
-                        "message": f"RAGエラー応答: {payload.get('error')}",
-                    }, ensure_ascii=True, indent=2)))
+                await _send_text(json.dumps({
+                    "status": "error",
+                    "message": f"RAGエラー応答: {payload.get('error')}",
+                }, ensure_ascii=True, indent=2))
                 return
 
             # ③ 安全ガード
             if not _is_read_only(payload):
-                await event_queue.enqueue_event(
-                    new_agent_text_message(json.dumps({
-                        "status": "blocked",
-                        "message": get_msg("eapi_blocked"),
-                        "payload": payload,
-                    }, ensure_ascii=True, indent=2)))
+                await _send_text(json.dumps({
+                    "status": "blocked",
+                    "message": get_msg("eapi_blocked"),
+                    "payload": payload,
+                }, ensure_ascii=True, indent=2))
                 return
 
             cmds = payload.get("params", {}).get("cmds", [])
@@ -1416,30 +1436,26 @@ class AristaEapiShowExecutor(AgentExecutor):
 
             logger.info(f"完了: cmds={cmds}")
             # ensure_ascii=True: 日本語・制御文字を全て \uXXXX / \n にエスケープ
-            await event_queue.enqueue_event(
-                new_agent_text_message(
-                    json.dumps(response_payload, ensure_ascii=True)))
+            await _send_text(json.dumps(response_payload, ensure_ascii=True))
 
         except pyeapi.eapilib.ConnectionError as e:
             logger.error(f"eAPI 接続エラー: {e}")
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps({
-                    "status":  "error",
-                    "message": f"eAPI 接続エラー: {e}",
-                    "hint": (
-                        f"接続先: {transport}://{host}:{port} "
-                        "確認事項: HTTPS/443 が稼働しているか "
-                        "(HTTP/80 は shutdown 実機確認済み)"
-                    ),
-                }, ensure_ascii=True, indent=2)))
+            await _send_text(json.dumps({
+                "status":  "error",
+                "message": f"eAPI 接続エラー: {e}",
+                "hint": (
+                    f"接続先: {transport}://{host}:{port} "
+                    "確認事項: HTTPS/443 が稼働しているか "
+                    "(HTTP/80 は shutdown 実機確認済み)"
+                ),
+            }, ensure_ascii=True, indent=2))
 
         except Exception as e:
             logger.error(f"eAPI 実行エラー: {e}", exc_info=True)
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps({
-                    "status":  "error",
-                    "message": get_msg("error") + f": {e}",
-                }, ensure_ascii=True, indent=2)))
+            await _send_text(json.dumps({
+                "status":  "error",
+                "message": get_msg("error") + f": {e}",
+            }, ensure_ascii=True, indent=2))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise UnsupportedOperationError("キャンセルはサポートされていません。")
@@ -1509,6 +1525,14 @@ async def _healthz():
 
 # ── Agent Card ─────────────────────────────────────────────────────────────────
 def build_agent_card() -> AgentCard:
+    # v1.1.0: url → supported_interfaces で AgentInterface を使用
+    #         defaultInputModes → default_input_modes (snake_case)
+    #         AgentCapabilities(streaming=False) → streaming フィールドなし（省略）
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
+
     return AgentCard(
         name="Arista cEOS eAPI Show Agent",
         description=(
@@ -1519,11 +1543,11 @@ def build_agent_card() -> AgentCard:
             "接続: pyeapi https/443（自己署名証明書）\n"
             "⚠️ 設定変更は port:8001 の NETCONF サーバが担当。"
         ),
-        url=A2A_PUBLIC_URL,
+        supported_interfaces=[iface],
         version="1.0.0",
-        defaultInputModes=["text"],
-        defaultOutputModes=["text"],
-        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(),
         skills=[
             AgentSkill(
                 id="arista_eapi_show_interfaces",
@@ -1573,11 +1597,18 @@ def main():
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,           # v1.1.0: agent_card が必須引数に変更
     )
-    a2a_app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=request_handler,
-    ).build()
+
+    # v1.1.0: A2AStarletteApplication が廃止され FastAPI + add_a2a_routes_to_fastapi に変更
+    from fastapi import FastAPI as _A2AFastAPI
+    a2a_app = _A2AFastAPI(title="Arista eAPI Show A2A Server")
+    add_a2a_routes_to_fastapi(
+        a2a_app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
 
     logger.info("=" * 60)
     logger.info("Arista cEOS eAPI Show A2A Server 起動")

@@ -123,15 +123,19 @@ except ImportError as _e:
     AsyncEOSDevice = anta_run = None
 
 # ── A2A SDK ───────────────────────────────────────────────────────────────────
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # ── FastAPI (REST ヘルス + スナップショット管理) ──────────────────────────────
 from fastapi import FastAPI, HTTPException
@@ -334,16 +338,17 @@ def _build_catalog_specs(categories: List[str]) -> Dict[str, Any]:
 
         # ── anta.tests.vlan ───────────────────────────────────────────────────
         elif cat == "vlan":
-            specs["anta.tests.vlan"] = [
-                {"VerifyVlanInternalPolicy": None},
-            ]
+            # VerifyVlanInternalPolicy: policy/start_vlan_id/end_vlan_id が必須
+            # VerifyVlanStatus: vlans が必須
+            # → デバイス固有パラメータが必要なためデフォルトカタログからは除外
+            pass
 
         # ── anta.tests.stp ────────────────────────────────────────────────────
         elif cat == "stp":
-            specs["anta.tests.stp"] = [
-                {"VerifySTPMode":         None},
-                {"VerifySTPBlockedPorts": None},
-            ]
+            # VerifySTPMode: vlans が必須
+            # VerifySTPBlockedPorts: vlans が必須
+            # → デバイス固有パラメータが必要なためデフォルトカタログからは除外
+            pass
 
     # routing サブモジュールをネスト辞書形式でセット
     if routing_specs:
@@ -770,16 +775,34 @@ class AristaAntaVerifyExecutor(AgentExecutor):
 
     # ── メインエントリ ────────────────────────────────────────────────────────
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # v1.1.0: Message を直接 enqueue する
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text: str) -> "_Message":
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            part = _Part(text=text)
+            msg.parts.append(part)
+            return msg
+
+        async def _send_text(text: str) -> None:
+            await event_queue.enqueue_event(_make_message(text))
+
         raw_text = "".join(
-            part.root.text for part in context.message.parts
-            if hasattr(part.root, "text")
+            part.text for part in context.message.parts
+            if part.HasField("text")
         )
         if not raw_text.strip():
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps({
+            await _send_text(json.dumps({
                     "status":  "error",
                     "message": get_msg("ws_empty"),
-                }, ensure_ascii=True)))
+                }, ensure_ascii=True))
             return
 
         params = self._parse_request(raw_text)
@@ -814,8 +837,7 @@ class AristaAntaVerifyExecutor(AgentExecutor):
                 "message": get_msg("error", locale) + f": {e}",
             }
 
-        await event_queue.enqueue_event(
-            new_agent_text_message(json.dumps(result, ensure_ascii=True)))
+        await _send_text(json.dumps(result, ensure_ascii=True))
 
     # ── action ディスパッチ ───────────────────────────────────────────────────
     async def _dispatch(
@@ -1129,6 +1151,10 @@ async def get_snapshot(snapshot_id: str):
 # ── Agent Card ─────────────────────────────────────────────────────────────────
 def build_agent_card() -> AgentCard:
     lib_status = "✅ 利用可能" if ANTA_AVAILABLE else "❌ 未インストール (pip install anta)"
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
     return AgentCard(
         name="Arista ANTA Snapshot Verify Agent",
         description=(
@@ -1147,11 +1173,11 @@ def build_agent_card() -> AgentCard:
             "  routing は ネスト辞書形式 / VerifyRoutingTableSize は min+max 両方必須\n"
             "  VerifyBGPPeersHealth は address_families 必須 / AntaCatalog.parse() 使用"
         ),
-        url=A2A_PUBLIC_URL,
+        supported_interfaces=[iface],
         version="2.0.0",
-        defaultInputModes=["text"],
-        defaultOutputModes=["text"],
-        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(),
         skills=[
             AgentSkill(
                 id="anta_snapshot",
@@ -1234,11 +1260,15 @@ def main():
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,           # v1.1.0: agent_card が必須引数に変更
     )
-    a2a_app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=request_handler,
-    ).build()
+    # v1.1.0: A2AStarletteApplication 廃止 → rest_app に A2A ルートを追加
+    add_a2a_routes_to_fastapi(
+        rest_app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
 
     logger.info("=" * 64)
     logger.info("Arista ANTA Snapshot Verify A2A Server v2.0.0 起動")
@@ -1261,16 +1291,8 @@ def main():
     logger.info("  nest_asyncio    : applied (A2A + anta_run 競合解消)")
     logger.info("=" * 64)
 
-    from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
-
-    combined = Starlette(routes=[
-        Route("/",                       endpoint=a2a_app, methods=["POST"]),
-        Route("/.well-known/agent.json", endpoint=a2a_app, methods=["GET"]),
-        Mount("/",                       app=rest_app),
-    ])
-
-    uvicorn.run(combined, host=A2A_HOST, port=A2A_PORT)
+    # v1.1.0: A2A ルートは rest_app に追加済みのため直接起動
+    uvicorn.run(rest_app, host=A2A_HOST, port=A2A_PORT)
 
 
 if __name__ == "__main__":

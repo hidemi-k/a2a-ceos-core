@@ -109,16 +109,20 @@ import uvicorn
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# A2A SDK（他のサーバと同じ構成）
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+# A2A SDK (v1.1.0)
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # ── LLM ファクトリ（xdp_a2a_server.py と同じ import）────────────────────────
 from llm_factory import (
@@ -590,18 +594,36 @@ class EapiConfigExecutor(AgentExecutor):
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
 
+        # v1.1.0: Message を直接 enqueue する
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text: str) -> "_Message":
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            part = _Part(text=text)
+            msg.parts.append(part)
+            return msg
+
+        async def _send_text(text: str) -> None:
+            await event_queue.enqueue_event(_make_message(text))
+
         # ── メッセージテキスト抽出 ────────────────────────────────────────────
         raw_text = ""
         for part in context.message.parts:
-            if hasattr(part.root, "text"):
-                raw_text += part.root.text
+            if part.HasField("text"):
+                raw_text += part.text
 
         if not raw_text.strip():
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps(
+            await _send_text(json.dumps(
                     {"status": "error", "message": get_msg("ws_empty")},
                     ensure_ascii=False,
-                ))
+                )
             )
             return
 
@@ -631,12 +653,11 @@ class EapiConfigExecutor(AgentExecutor):
                 logger.info("LLM でコマンドを生成中...")
                 cmds = _generate_cli_cmds(self._llm, query)
                 if not cmds:
-                    await event_queue.enqueue_event(
-                        new_agent_text_message(json.dumps({
+                    await _send_text(json.dumps({
                             "status":  "error",
                             "query":   query,
                             "message": "LLM がコマンドを生成できませんでした。クエリを具体的に入力してください。",
-                        }, ensure_ascii=False))
+                        }, ensure_ascii=False)
                     )
                     return
 
@@ -644,13 +665,12 @@ class EapiConfigExecutor(AgentExecutor):
             forbidden_reason = _check_forbidden(cmds)
             if forbidden_reason:
                 logger.warning(f"禁止コマンド検出: {forbidden_reason}")
-                await event_queue.enqueue_event(
-                    new_agent_text_message(json.dumps({
+                await _send_text(json.dumps({
                         "status":  "blocked",
                         "query":   query,
                         "cmds":    cmds,
                         "message": f"安全ガードによりブロック: {forbidden_reason}",
-                    }, ensure_ascii=False))
+                    }, ensure_ascii=False)
                 )
                 return
 
@@ -671,13 +691,12 @@ class EapiConfigExecutor(AgentExecutor):
                 )
 
                 if session_result["status"] != "ok":
-                    await event_queue.enqueue_event(
-                        new_agent_text_message(json.dumps({
+                    await _send_text(json.dumps({
                             "status":  "error",
                             "query":   query,
                             "cmds":    cmds,
                             "message": session_result["message"],
-                        }, ensure_ascii=False))
+                        }, ensure_ascii=False)
                     )
                     return
 
@@ -721,13 +740,12 @@ class EapiConfigExecutor(AgentExecutor):
                 )
 
                 if session_result["status"] != "ok":
-                    await event_queue.enqueue_event(
-                        new_agent_text_message(json.dumps({
+                    await _send_text(json.dumps({
                             "status":  "error",
                             "query":   query,
                             "cmds":    cmds,
                             "message": session_result["message"],
-                        }, ensure_ascii=False))
+                        }, ensure_ascii=False)
                     )
                     return
 
@@ -760,21 +778,17 @@ class EapiConfigExecutor(AgentExecutor):
                 logger.info(f"Phase2 完了: persist={persist}")
 
             # ── レスポンス送信 ────────────────────────────────────────────────
-            await event_queue.enqueue_event(
-                new_agent_text_message(
+            await _send_text(
                     json.dumps(result, ensure_ascii=False, indent=2)
                 )
-            )
 
         except Exception as e:
             logger.error(f"Executor エラー: {e}", exc_info=True)
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps({
+            await _send_text(json.dumps({
                     "status":  "error",
                     "query":   query,
                     "message": str(e),
                 }, ensure_ascii=False))
-            )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
@@ -787,6 +801,11 @@ class EapiConfigExecutor(AgentExecutor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_agent_card() -> AgentCard:
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
+
     return AgentCard(
         name        = "Arista eAPI Config Agent",
         description = (
@@ -795,11 +814,11 @@ def build_agent_card() -> AgentCard:
             "2段階実行: dry-run（diffs 確認）→ 承認 → commit。\n"
             f"対象デバイス: {EAPI_HOST}:{EAPI_PORT} ({EAPI_TRANSPORT})"
         ),
-        url                = A2A_PUBLIC_URL,
-        version            = VERSION,
-        defaultInputModes  = ["text"],
-        defaultOutputModes = ["text"],
-        capabilities = AgentCapabilities(streaming=False),
+        supported_interfaces = [iface],
+        version              = VERSION,
+        default_input_modes  = ["text"],
+        default_output_modes = ["text"],
+        capabilities = AgentCapabilities(),
         skills = [
             AgentSkill(
                 id          = "vxlan_config",
@@ -889,11 +908,17 @@ def main() -> None:
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,           # v1.1.0: agent_card が必須引数に変更
     )
-    a2a_app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=request_handler,
-    ).build()
+    # v1.1.0: A2AStarletteApplication 廃止 → FastAPI + add_a2a_routes_to_fastapi
+    from fastapi import FastAPI as _A2AFastAPI
+    a2a_app = _A2AFastAPI(title="Arista eAPI Config A2A Server")
+    add_a2a_routes_to_fastapi(
+        a2a_app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
 
     logger.info("=" * 60)
     logger.info("Arista eAPI Config A2A Server 起動")

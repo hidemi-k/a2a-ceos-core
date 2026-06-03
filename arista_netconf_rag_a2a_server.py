@@ -80,16 +80,20 @@ import uvicorn
 from i18n import get_msg, locale_from_request, LOCALE
 
 
-# A2A SDK
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+# A2A SDK (v1.1.0)
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # LangChain
 from langchain_community.vectorstores import FAISS
@@ -1617,11 +1621,14 @@ class NetconfRagWorkerArista:
         self.skill_execution_log: List[Dict] = []
         self.conversation_history: List[Message] = []
         self.skills = {sk.name: sk for sk in (skills or ALL_SKILLS)}
+        # v1.7.0: client が第1位置引数に変更（name はキーワード引数）
         self.xml_generator = Agent(
-            name="XMLGenerator", client=make_client(),
+            make_client(),
+            name="XMLGenerator",
             instructions=GENERATOR_INSTRUCTIONS)
         self.xml_reviewer = Agent(
-            name="XMLReviewer", client=make_client(),
+            make_client(),
+            name="XMLReviewer",
             instructions=REVIEWER_INSTRUCTIONS)
 
     def log(self, msg: str):
@@ -2420,14 +2427,32 @@ class AristaNetconfRagExecutor(AgentExecutor):
         return {"query": text}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # v1.1.0: Message を直接 enqueue する
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text: str) -> "_Message":
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            part = _Part(text=text)
+            msg.parts.append(part)
+            return msg
+
+        async def _send_text(text: str) -> None:
+            await event_queue.enqueue_event(_make_message(text))
+
         raw_text = ""
         for part in context.message.parts:
-            if hasattr(part.root, "text"):
-                raw_text += part.root.text
+            if part.HasField("text"):
+                raw_text += part.text
 
         if not raw_text.strip():
-            await event_queue.enqueue_event(
-                new_agent_text_message("メッセージが空です。"))
+            await _send_text("メッセージが空です。")
             return
 
         params    = self._parse_request(raw_text)
@@ -2512,14 +2537,12 @@ class AristaNetconfRagExecutor(AgentExecutor):
             }
 
             logger.info(f"完了: {agg.get('summary', '')}")
-            await event_queue.enqueue_event(
-                new_agent_text_message(
-                    json.dumps(response_payload, ensure_ascii=False, indent=2)))
+            await _send_text(
+                    json.dumps(response_payload, ensure_ascii=False, indent=2))
 
         except Exception as e:
             logger.error(f"Orchestrator エラー: {e}", exc_info=True)
-            await event_queue.enqueue_event(
-                new_agent_text_message(f"エラーが発生しました: {e}"))
+            await _send_text(f"エラーが発生しました: {e}")
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise UnsupportedOperationError("キャンセルはサポートされていません。")
@@ -2527,6 +2550,11 @@ class AristaNetconfRagExecutor(AgentExecutor):
 
 # ── Agent Card ─────────────────────────────────────────────────────────────────
 def build_agent_card() -> AgentCard:
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
+
     return AgentCard(
         name="Arista cEOS NETCONF RAG Agent",
         description=(
@@ -2538,11 +2566,11 @@ def build_agent_card() -> AgentCard:
             "のフルサイクルをサポート。\n"
             "⚠️ オペレーショナル状態の確認は port:8002 の eAPI サーバが担当。"
         ),
-        url=A2A_PUBLIC_URL,
+        supported_interfaces=[iface],
         version="1.0.0",
-        defaultInputModes=["text"],
-        defaultOutputModes=["text"],
-        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(),
         skills=[
             AgentSkill(
                 id="arista_netconf_write",
@@ -2592,11 +2620,17 @@ def main():
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,           # v1.1.0: agent_card が必須引数に変更
     )
-    app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=request_handler,
-    ).build()
+    # v1.1.0: A2AStarletteApplication 廃止 → FastAPI + add_a2a_routes_to_fastapi
+    from fastapi import FastAPI as _A2AFastAPI
+    app = _A2AFastAPI(title="Arista NETCONF RAG A2A Server")
+    add_a2a_routes_to_fastapi(
+        app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
 
     logger.info("=" * 60)
     logger.info("Arista cEOS NETCONF RAG A2A Server 起動")

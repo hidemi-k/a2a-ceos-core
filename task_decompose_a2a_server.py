@@ -40,15 +40,19 @@ from pydantic import BaseModel
 from starlette.routing import Route, WebSocketRoute
 
 # A2A SDK
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # LangChain
 from langchain_openai import ChatOpenAI
@@ -338,46 +342,57 @@ def classify_query(query: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _make_a2a_request(payload: dict, msg_id: str = None) -> dict:
+    # v1.1.0: jsonrpc ラッパーなし、REST 形式で直接送信
     mid = msg_id or f"hub-{datetime.now().strftime('%H%M%S%f')}"
     return {
-        "jsonrpc": "2.0", "id": mid, "method": "message/send",
-        "params": {"message": {
-            "role": "user",
-            "parts": [{"kind": "text",
-                       "text": json.dumps(payload, ensure_ascii=False)}],
+        "message": {
+            "role": "ROLE_USER",
+            "parts": [{"text": json.dumps(payload, ensure_ascii=False)}],
             "messageId": mid,
-        }},
+        },
+        "configuration": {"returnImmediately": False},
     }
 
 
+# v1.1.0: A2A-Version ヘッダーが必須
+_A2A_HEADERS = {"A2A-Version": "1.0", "Content-Type": "application/json"}
+
+
 def _extract_text(a2a_resp: dict) -> dict:
-    """A2A レスポンスからテキストを取り出し JSON として返す。ネスト展開付き。"""
+    """A2A v1.1.0 レスポンスからテキストを取り出し JSON として返す。ネスト展開付き。"""
     try:
-        parts = a2a_resp.get("result", {}).get("parts", [])
+        # v1.1.0: {"message": {"parts": [{"text": "..."}]}} 形式
+        parts = a2a_resp.get("message", {}).get("parts", [])
+        if not parts:
+            # 旧形式フォールバック
+            parts = a2a_resp.get("result", {}).get("parts", [])
         if not parts:
             parts = a2a_resp.get("result", {}).get("message", {}).get("parts", [])
         for part in parts:
-            if part.get("kind") == "text":
-                try:
-                    parsed = json.loads(part["text"])
-                except json.JSONDecodeError:
-                    return {"_raw_text": part["text"]}
-                # Hub 経由のネスト展開
-                inner = parsed.get("result")
-                if (isinstance(inner, dict)
-                        and inner.get("jsonrpc") == "2.0"
-                        and "result" in inner):
-                    parsed["result"] = _extract_text(inner)
-                return parsed
+            # v1.1.0: {"text": "..."} 形式（kind フィールドなし）
+            text = part.get("text") if isinstance(part, dict) else None
+            if text is None:
+                continue
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return {"_raw_text": text}
+            # Hub 経由のネスト展開
+            inner = parsed.get("result")
+            if isinstance(inner, dict) and "message" in inner:
+                parsed["result"] = _extract_text(inner)
+            return parsed
         return {"_raw_a2a": a2a_resp}
     except Exception as e:
         return {"_parse_error": str(e)}
 
 
 async def _forward(target_url: str, payload: dict) -> dict:
+    # v1.1.0: /message:send エンドポイント + A2A-Version ヘッダー必須
     a2a_req = _make_a2a_request(payload)
+    endpoint = target_url.rstrip("/") + "/message:send"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(target_url, json=a2a_req)
+        resp = await client.post(endpoint, json=a2a_req, headers=_A2A_HEADERS)
         resp.raise_for_status()
         return _extract_text(resp.json())
 
@@ -406,12 +421,29 @@ class TaskDecomposeExecutor(AgentExecutor):
         return {"query": text}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text):
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            msg.parts.append(_Part(text=text))
+            return msg
+
+        async def _send_text(text):
+            await event_queue.enqueue_event(_make_message(text))
+
         raw_text = "".join(
-            part.root.text for part in context.message.parts
-            if hasattr(part.root, "text")
+            part.text for part in context.message.parts
+            if part.HasField("text")
         )
         if not raw_text.strip():
-            await event_queue.enqueue_event(new_agent_text_message(get_msg("ws_empty")))
+            await _send_text(get_msg("ws_empty"))
             return
 
         params    = self._parse_request(raw_text)
@@ -419,11 +451,21 @@ class TaskDecomposeExecutor(AgentExecutor):
         device_ip = params.get("device_ip")
         username  = params.get("username")
         password  = params.get("password")
-        port      = params.get("port", "830")
+        # port はルート別に使い分け（NETCONF:830 / eAPI:各サーバデフォルト）
+        port      = params.get("port")   # None の場合は転送先サーバのデフォルトを使用
         deploy    = params.get("deploy", False)
 
         logger.info(f"[A2A] 受信: {query[:80]} deploy={deploy}")
-        route = classify_query(query)
+
+        # action フィールドが明示されている場合は classify_query より優先
+        _action = params.get("action", "")
+        if _action in ("verify", "snapshot", "post_check", "compare"):
+            route = "verify"
+        elif _action in ("block", "unblock", "qos_set", "qos_list", "qos_get",
+                         "drop_list", "stats", "top", "info", "analyze"):
+            route = "security"
+        else:
+            route = classify_query(query)
 
         if route == "security":
             xdp_payload = {"query": query}
@@ -468,8 +510,13 @@ class TaskDecomposeExecutor(AgentExecutor):
             forward_payload = {
                 "query": query, "device_ip": device_ip or "",
                 "username": username or "", "password": password or "",
-                "port": port, "deploy": deploy,
+                "deploy": deploy,
             }
+            # NETCONF(write) のみ port を転送。read は eAPI サーバのデフォルト(443)を使用
+            if route == "write" and port:
+                forward_payload["port"] = port
+            elif route == "write":
+                forward_payload["port"] = "830"
             try:
                 inner = await _forward(target_url, forward_payload)
                 result = {"query": query, "route": route,
@@ -482,8 +529,7 @@ class TaskDecomposeExecutor(AgentExecutor):
                 result = {"query": query, "route": route, "routed_to": target_url,
                           "status": "error", "message": str(e)}
 
-        await event_queue.enqueue_event(
-            new_agent_text_message(json.dumps(result, ensure_ascii=False, indent=2)))
+        await _send_text(json.dumps(result, ensure_ascii=False, indent=2))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise UnsupportedOperationError(get_msg("cancel_unsupported"))
@@ -1433,6 +1479,10 @@ async def anta_list_snapshots():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_agent_card() -> AgentCard:
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
     return AgentCard(
         name="task_decompose A2A Hub v2",
         description=(
@@ -1444,11 +1494,11 @@ def build_agent_card() -> AgentCard:
             "REST: /healthz /execute /deploy/{trace_id} /diff/{trace_id} "
             "/anta/snapshot /anta/post_check WS:/ws/updates"
         ),
-        url=A2A_PUBLIC_URL,
+        supported_interfaces=[iface],
         version=VERSION,
-        defaultInputModes=["text"],
-        defaultOutputModes=["text"],
-        capabilities=AgentCapabilities(streaming=False),
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(),
         skills=[
             AgentSkill(
                 id="task_route",
@@ -1508,41 +1558,21 @@ def build_agent_card() -> AgentCard:
 
 
 def main():
+    agent_card      = build_agent_card()
     executor        = TaskDecomposeExecutor()
     request_handler = DefaultRequestHandler(
-        agent_executor=executor, task_store=InMemoryTaskStore())
-    a2a_app = A2AStarletteApplication(
-        agent_card=build_agent_card(), http_handler=request_handler).build()
-
-    # A2A ルートを REST アプリにマウント
-    # A2A: POST / と GET /.well-known/agent.json
-    # REST: /healthz /execute /deploy /diff /ws
-    # → A2A の / は REST の /a2a/ 以下にマウントし、
-    #   /.well-known/ は REST に直接追加する方式が最もシンプル
-    # ここでは uvicorn で REST アプリをメインとし、
-    # A2A エンドポイントを REST アプリに追加する
-
-    from starlette.applications import Starlette
-    from starlette.routing import Mount
-
-    # A2A ルートを /a2a プレフィックスなしで REST に統合
-    # /.well-known/agent.json と POST / は A2A が使う
-    # /healthz /execute 等は FastAPI が使う
-    # → 両方を Starlette の routes にマージ
-
-    from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
-
-    combined = Starlette(routes=[
-        # A2A: POST / (JSON-RPC)
-        Route("/",          endpoint=a2a_app, methods=["POST"]),
-        # A2A: Agent Card
-        Route("/.well-known/agent.json",
-              endpoint=a2a_app, methods=["GET"]),
-        # REST: FastAPI を /api 以下にマウント
-        Mount("/api", app=rest_app),
-        # REST: / 以下を FastAPI に直接マウント（/healthz /execute 等）
-        Mount("/", app=rest_app),
-    ])
+        agent_executor=executor,
+        task_store=InMemoryTaskStore(),
+        agent_card=agent_card,
+    )
+    # v1.1.0: rest_app に A2A ルートを追加して一本化
+    add_a2a_routes_to_fastapi(
+        rest_app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
+    combined = rest_app
 
     logger.info("=" * 64)
     logger.info("task_decompose A2A Hub v2 起動 (ANTA Snapshot 対応)")

@@ -107,15 +107,19 @@ import pyeapi
 import uvicorn
 
 # A2A SDK
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.types import (
-    AgentCard, AgentCapabilities, AgentSkill, UnsupportedOperationError,
+    AgentCard, AgentCapabilities, AgentSkill,
 )
+from a2a.utils.errors import UnsupportedOperationError
 
 # agent-framework（ノートブックと同じ MAF クライアント）
 from agent_framework import Agent, Message
@@ -451,8 +455,8 @@ class NetworkDiagnosticSystem:
 
         # ① フロー遷移判断エージェント
         self.cmd_agent = Agent(
-            name="フロー遷移判断",
-            client=self._client,
+            self._client,
+            name="フロー遷移判断",  # v1.7.0: client が第1位置引数
             instructions=(
                 "あなたはネットワーク障害診断のトリアージ専門家です。"
                 "ユーザーの状況説明を読み、診断フローを選択してください。"
@@ -465,8 +469,8 @@ class NetworkDiagnosticSystem:
 
         # ② L2分析エージェント
         self.l2_agent = Agent(
+            self._client,
             name="L2分析",
-            client=self._client,
             instructions=(
                 "あなたは L2 層（データリンク層）の専門分析エージェントです。\n"
                 "提供されたコマンド出力を分析し、以下の観点で異常を特定してください:\n"
@@ -495,8 +499,8 @@ class NetworkDiagnosticSystem:
 
         # ③ L3分析エージェント
         self.l3_agent = Agent(
+            self._client,
             name="L3分析",
-            client=self._client,
             instructions=(
                 "あなたは L3 層（ネットワーク層）の専門分析エージェントです。\n"
                 "提供されたコマンド出力を分析し、以下の観点で異常を特定してください:\n"
@@ -527,8 +531,8 @@ class NetworkDiagnosticSystem:
 
         # ④ 整合性チェックエージェント（Self-Correction）
         self.consistency_agent = Agent(
+            self._client,
             name="整合性チェック",
-            client=self._client,
             instructions=(
                 "あなたは L2/L3 整合性の専門チェックエージェントです。\n"
                 "L2 分析結果と L3 分析結果を突き合わせ、以下のような矛盾を検出してください:\n"
@@ -544,8 +548,8 @@ class NetworkDiagnosticSystem:
 
         # ⑤ 診断レポートエージェント
         self.report_agent = Agent(
+            self._client,
             name="診断レポート",
-            client=self._client,
             instructions=(
                 "あなたはネットワーク障害診断の最終レポート作成エージェントです。\n"
                 "L2分析・L3分析・整合性チェックの結果と、OS固有の復旧ヒントを統合し、\n"
@@ -910,19 +914,33 @@ class NetworkDiagnosticExecutor(AgentExecutor):
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
-        # メッセージテキスト抽出（xdp_a2a_server.py と同じパターン）
+        from a2a.types.a2a_pb2 import Part as _Part, Message as _Message, Role as _Role
+        import uuid as _uuid
+
+        def _make_message(text):
+            msg = _Message()
+            msg.role = _Role.ROLE_AGENT
+            msg.message_id = str(_uuid.uuid4())
+            if context.task_id:
+                msg.task_id = context.task_id
+            if context.context_id:
+                msg.context_id = context.context_id
+            msg.parts.append(_Part(text=text))
+            return msg
+
+        async def _send_text(text):
+            await event_queue.enqueue_event(_make_message(text))
+
         raw_text = ""
         for part in context.message.parts:
-            if hasattr(part.root, "text"):
-                raw_text += part.root.text
+            if part.HasField("text"):
+                raw_text += part.text
 
         if not raw_text.strip():
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps(
+            await _send_text(json.dumps(
                     {"status": "error", "message": get_msg("ws_empty")},
                     ensure_ascii=True,
                 ))
-            )
             return
 
         params     = self._parse_request(raw_text)
@@ -959,16 +977,13 @@ class NetworkDiagnosticExecutor(AgentExecutor):
                     forced_flow=forced_flow,
                 )
 
-            await event_queue.enqueue_event(
-                new_agent_text_message(
+            await _send_text(
                     json.dumps(result, ensure_ascii=False, indent=2)
                 )
-            )
 
         except Exception as e:
             logger.error(f"Executor エラー: {e}", exc_info=True)
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps(
+            await _send_text(json.dumps(
                     {
                         "status":  "error",
                         "query":   query,
@@ -976,7 +991,6 @@ class NetworkDiagnosticExecutor(AgentExecutor):
                     },
                     ensure_ascii=True,
                 ))
-            )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
@@ -989,6 +1003,10 @@ class NetworkDiagnosticExecutor(AgentExecutor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_agent_card() -> AgentCard:
+    from a2a.types.a2a_pb2 import AgentInterface
+    iface = AgentInterface()
+    iface.url = A2A_PUBLIC_URL
+    iface.protocol_version = "1.0"
     return AgentCard(
         name        = "Network Diagnostic Agent",
         description = (
@@ -997,11 +1015,11 @@ def build_agent_card() -> AgentCard:
             "Arista cEOS の eAPI から show コマンドを取得し、"
             "根本原因・影響範囲・推奨アクションを日本語レポートで返す。"
         ),
-        url               = A2A_PUBLIC_URL,
-        version           = VERSION,
-        defaultInputModes  = ["text"],
-        defaultOutputModes = ["text"],
-        capabilities = AgentCapabilities(streaming=False),
+        supported_interfaces = [iface],
+        version              = VERSION,
+        default_input_modes  = ["text"],
+        default_output_modes = ["text"],
+        capabilities = AgentCapabilities(),
         skills = [
             AgentSkill(
                 id          = "diagnose_full",
@@ -1073,11 +1091,16 @@ def main() -> None:
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
-    )
-    a2a_app = A2AStarletteApplication(
         agent_card=agent_card,
-        http_handler=request_handler,
-    ).build()
+    )
+    from fastapi import FastAPI as _A2AFastAPI
+    a2a_app = _A2AFastAPI(title="Network Diagnostic A2A Server")
+    add_a2a_routes_to_fastapi(
+        a2a_app,
+        agent_card_routes=create_agent_card_routes(agent_card),
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        rest_routes=create_rest_routes(request_handler),
+    )
 
     logger.info("=" * 60)
     logger.info("Network Diagnostic A2A Server 起動  v2.0.0")

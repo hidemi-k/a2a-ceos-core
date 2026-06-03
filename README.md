@@ -198,9 +198,7 @@ pip install -r requirements.txt
 ```
 
 > **Note**
-> `a2a-sdk` is pinned to `0.3.23`. Version `1.0.x` removed `a2a.server.apps`, which breaks all A2A servers in this project.
-> `agent-framework` is pinned to `1.4.0`. From `agent-framework-a2a 1.0.0b260514` onward, `a2a-sdk 1.0.x` is required, causing a version conflict.
-> Do not upgrade these packages when running `pip install`.
+> See `requirements.txt` for pinned versions of `a2a-sdk` and `agent-framework`.
 
 ### Configure
 
@@ -374,13 +372,16 @@ The NETCONF RAG includes **real-hardware-verified XML templates** as a 4th knowl
 `agent_framework_openai.OpenAIChatCompletionClient` is used in 2 servers: NETCONF Agent (XML generation) and Diagnose Agent (5-agent construction). It abstracts Groq and Azure OpenAI behind a single interface and automatically falls back on failure. 6 Agent instances in total are built with Microsoft Agent Framework (NETCONF Agent: 1, Diagnose Agent: 5).
 
 ```python
+from agent_framework import Agent
 from agent_framework_openai import OpenAIChatCompletionClient
 
 client = OpenAIChatCompletionClient(
-    model   = GROQ_MODEL,
-    api_key = _GROQ_KEY,
-    base_url= GROQ_BASE_URL,
+    model    = GROQ_MODEL,
+    api_key  = _GROQ_KEY,
+    base_url = GROQ_BASE_URL,
 )
+# client is the first positional argument (changed in MAF 1.7.0)
+agent = Agent(client, name="AgentName", instructions="...")
 ```
 
 ### eAPI configure session limit handling (eAPI Config Agent)

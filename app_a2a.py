@@ -457,25 +457,29 @@ async def xdp_get(path: str, params: dict = None):
 
 
 def _xdp_extract_text_as_json(a2a_resp: dict) -> dict:
-    """A2A レスポンスから JSON を抽出する。arista_a2a_client_test_v5 準拠。"""
+    """A2A v1.1.0 レスポンスから JSON を抽出する。"""
     try:
-        result_obj = a2a_resp.get("result", {})
-        parts = result_obj.get("parts", [])
+        # v1.1.0: {"message": {"parts": [{"text": "..."}]}} 形式
+        parts = a2a_resp.get("message", {}).get("parts", [])
         if not parts:
-            parts = result_obj.get("message", {}).get("parts", [])
+            # 旧形式フォールバック
+            result_obj = a2a_resp.get("result", {})
+            parts = result_obj.get("parts", [])
+        if not parts:
+            parts = a2a_resp.get("result", {}).get("message", {}).get("parts", [])
         for part in parts:
-            if part.get("kind") == "text":
-                text = part["text"]
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError:
-                    return {"_raw_text": text}
-                inner = parsed.get("result")
-                if (isinstance(inner, dict)
-                        and inner.get("jsonrpc") == "2.0"
-                        and "result" in inner):
-                    parsed["result"] = _xdp_extract_text_as_json(inner)
-                return parsed
+            # v1.1.0: {"text": "..."} 形式（kind フィールドなし）
+            text = part.get("text") if isinstance(part, dict) else None
+            if text is None:
+                continue
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return {"_raw_text": text}
+            inner = parsed.get("result")
+            if isinstance(inner, dict) and "message" in inner:
+                parsed["result"] = _xdp_extract_text_as_json(inner)
+            return parsed
         return {"status": "error", "message": "parts empty",
                 "_raw": str(a2a_resp)[:300]}
     except Exception as e:
@@ -483,20 +487,22 @@ def _xdp_extract_text_as_json(a2a_resp: dict) -> dict:
 
 
 async def xdp_a2a_post(payload: dict) -> dict:
-    """XDP A2A Server (port:8003) へ A2A リクエストを送信して結果を返す。"""
+    """XDP A2A Server (port:8003) へ A2A v1.1.0 リクエストを送信して結果を返す。"""
     mid = f"ui-{datetime.now().strftime('%H%M%S%f')}"
     req = {
-        "jsonrpc": "2.0", "id": mid, "method": "message/send",
-        "params": {"message": {
-            "role": "user",
-            "parts": [{"kind": "text",
-                       "text": json.dumps(payload, ensure_ascii=False)}],
+        "message": {
+            "role": "ROLE_USER",
+            "parts": [{"text": json.dumps(payload, ensure_ascii=False)}],
             "messageId": mid,
-        }},
+        },
+        "configuration": {"returnImmediately": False},
     }
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(XDP_URL, json=req)
+            resp = await client.post(
+                XDP_URL.rstrip("/") + "/message:send", json=req,
+                headers={"A2A-Version": "1.0", "Content-Type": "application/json"},
+            )
             resp.raise_for_status()
             data = resp.json()
         return _xdp_extract_text_as_json(data)
@@ -509,8 +515,7 @@ async def xdp_a2a_post(payload: dict) -> dict:
 
 async def anta_a2a_post(payload: dict) -> dict:
     """
-    ANTA Verify A2A Server (port:8004) へ A2A リクエストを送信して結果を返す。
-    xdp_a2a_post と同じ A2A JSON-RPC パターンを使用する。
+    ANTA Verify A2A Server (port:8004) へ A2A v1.1.0 リクエストを送信して結果を返す。
 
     payload 例:
         {"action": "snapshot", "query": "...", "device_ip": "...", ...}
@@ -519,17 +524,19 @@ async def anta_a2a_post(payload: dict) -> dict:
     """
     mid = f"anta-ui-{datetime.now().strftime('%H%M%S%f')}"
     req = {
-        "jsonrpc": "2.0", "id": mid, "method": "message/send",
-        "params": {"message": {
-            "role": "user",
-            "parts": [{"kind": "text",
-                       "text": json.dumps(payload, ensure_ascii=False)}],
+        "message": {
+            "role": "ROLE_USER",
+            "parts": [{"text": json.dumps(payload, ensure_ascii=False)}],
             "messageId": mid,
-        }},
+        },
+        "configuration": {"returnImmediately": False},
     }
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:  # ANTA は時間がかかる
-            resp = await client.post(ANTA_URL, json=req)
+            resp = await client.post(
+                ANTA_URL.rstrip("/") + "/message:send", json=req,
+                headers={"A2A-Version": "1.0", "Content-Type": "application/json"},
+            )
             resp.raise_for_status()
             data = resp.json()
         return _xdp_extract_text_as_json(data)  # A2A レスポンス展開は共通
@@ -3649,16 +3656,15 @@ def main():
                     # ── ヘルパー: A2A レスポンスから診断JSON を取り出す ────────
                     def _parse_diag_response(data: dict) -> dict:
                         try:
-                            result_obj = data.get("result", {})
-                            parts = result_obj.get("parts", [])
+                            # v1.1.0: {"message": {"parts": [{"text": "..."}]}} 形式
+                            parts = data.get("message", {}).get("parts", [])
                             if not parts:
-                                parts = result_obj.get("message", {}).get("parts", [])
+                                result_obj = data.get("result", {})
+                                parts = result_obj.get("parts", [])
+                            if not parts:
+                                parts = data.get("result", {}).get("message", {}).get("parts", [])
                             for part in parts:
-                                text_val = None
-                                if part.get("kind") == "text":
-                                    text_val = part.get("text", "")
-                                elif isinstance(part.get("root"), dict):
-                                    text_val = part["root"].get("text", "")
+                                text_val = part.get("text") if isinstance(part, dict) else None
                                 if text_val:
                                     try:
                                         return json.loads(text_val)
@@ -3689,18 +3695,21 @@ def main():
                             "flow":       "full",
                         }, ensure_ascii=False)
                         a2a_payload = {
-                            "jsonrpc": "2.0", "id": "snap-diag",
-                            "method": "message/send",
-                            "params": {"message": {
-                                "role": "user",
+                            "message": {
+                                "role": "ROLE_USER",
                                 "parts": [{"text": payload_text}],
                                 "messageId": f"snap-{datetime.now().strftime('%H%M%S')}",
-                            }},
+                            },
+                            "configuration": {"returnImmediately": False},
                         }
 
                         try:
                             async with httpx.AsyncClient(timeout=60) as client:
-                                resp = await client.post(DIAGNOSE_URL, json=a2a_payload)
+                                resp = await client.post(
+                                    DIAGNOSE_URL.rstrip("/") + "/message:send",
+                                    json=a2a_payload,
+                                    headers={"A2A-Version": "1.0", "Content-Type": "application/json"},
+                                )
                                 resp.raise_for_status()
                                 result_json = _parse_diag_response(resp.json())
 
@@ -3821,19 +3830,22 @@ def main():
                         }, ensure_ascii=False)
 
                         a2a_payload = {
-                            "jsonrpc": "2.0", "id": "diag-1",
-                            "method": "message/send",
-                            "params": {"message": {
-                                "role": "user",
+                            "message": {
+                                "role": "ROLE_USER",
                                 "parts": [{"text": payload_text}],
                                 "messageId": f"diag-{datetime.now().strftime('%H%M%S')}",
-                            }},
+                            },
+                            "configuration": {"returnImmediately": False},
                         }
 
                         started = datetime.now()
                         try:
                             async with httpx.AsyncClient(timeout=120) as client:
-                                resp = await client.post(DIAGNOSE_URL, json=a2a_payload)
+                                resp = await client.post(
+                                    DIAGNOSE_URL.rstrip("/") + "/message:send",
+                                    json=a2a_payload,
+                                    headers={"A2A-Version": "1.0", "Content-Type": "application/json"},
+                                )
                                 resp.raise_for_status()
                                 result_json = _parse_diag_response(resp.json())
 
