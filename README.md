@@ -407,7 +407,6 @@ Five specialist agents (flow routing / L2 analysis / L3 analysis / consistency c
 
 **Agent protocol**
 - [A2A Protocol (Google)](https://github.com/google/A2A)
-- [A2A Discussions #1774 — Artifact design best practices](https://github.com/a2aproject/A2A/discussions/1774)
 - [Microsoft Agent Framework](https://github.com/microsoft/agent-framework)
 
 **Lab environment**
