@@ -977,9 +977,40 @@ class NetworkDiagnosticExecutor(AgentExecutor):
                     forced_flow=forced_flow,
                 )
 
-            await _send_text(
-                    json.dumps(result, ensure_ascii=False, indent=2)
-                )
+            # ── #1774: Message と Artifact を分離して返す ─────────────────────
+            if mode == "diagnose" and result.get("status") == "success":
+                # Message: 人間が読む要約（report テキスト + status のみ）
+                summary_for_message = {
+                    "status":    result.get("status"),
+                    "vendor_key": result.get("vendor_key"),
+                    "flow":      result.get("flow"),
+                    "report":    result.get("report", ""),
+                    "self_correction_triggered": result.get("self_correction_triggered", False),
+                    "elapsed_seconds": result.get("elapsed_seconds", 0),
+                }
+                await _send_text(
+                        json.dumps(summary_for_message, ensure_ascii=False, indent=2))
+
+                # Artifact: 完全な診断データ（commands_executed / l2_analysis 等を含む）
+                try:
+                    from a2a.types.a2a_pb2 import Artifact as _Artifact
+                    art = _Artifact()
+                    art.artifact_id = f"diagnose-report-{context.task_id or 'unknown'}"
+                    art.name        = "report"
+                    art.description = f"ネットワーク診断レポート (flow={result.get('flow','')})"
+                    art.parts.append(_Part(
+                        text=json.dumps(result, ensure_ascii=False, indent=2)))
+                    await event_queue.enqueue_event(art)
+                    logger.info(f"[Diagnose] Artifact 送出: report (flow={result.get('flow','')})")
+                except Exception as _e:
+                    # フォールバック: 完全データを Message で再送
+                    logger.debug(f"[Diagnose] Artifact 送出スキップ（SDK非対応）: {_e}")
+                    await _send_text(
+                            json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                # snapshot モード・エラー時はそのまま Message で返す
+                await _send_text(
+                        json.dumps(result, ensure_ascii=False, indent=2))
 
         except Exception as e:
             logger.error(f"Executor エラー: {e}", exc_info=True)

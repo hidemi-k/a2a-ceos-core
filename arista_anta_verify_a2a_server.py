@@ -837,7 +837,38 @@ class AristaAntaVerifyExecutor(AgentExecutor):
                 "message": get_msg("error", locale) + f": {e}",
             }
 
-        await _send_text(json.dumps(result, ensure_ascii=True))
+        # ── #1774: Message と Artifact を分離して返す ─────────────────────────
+        # Message には人間が読む要約のみを載せる（会話パート）
+        # Artifact には完全なテスト結果 JSON を載せる（最終成果物パート）
+        summary_for_message = {
+            "status":        result.get("status"),
+            "summary":       result.get("summary"),
+            "tests_total":   result.get("tests_total"),
+            "tests_passed":  result.get("tests_passed"),
+            "tests_failed":  result.get("tests_failed"),
+            "tests_skipped": result.get("tests_skipped"),
+            # snapshot_id・new_issues・action は UI ロジックに必要なため Message にも含める
+            "snapshot_id":   result.get("snapshot_id", ""),
+            "new_issues":    result.get("new_issues",  []),
+            "action":        result.get("action",      action),
+            "engine":        result.get("engine",      "anta-official"),
+        }
+        await _send_text(json.dumps(summary_for_message, ensure_ascii=True))
+
+        # Artifact: 完全な ANTA レポート（UI の structured viewer・他エージェントが利用）
+        try:
+            from a2a.types.a2a_pb2 import Artifact as _Artifact
+            art = _Artifact()
+            art.artifact_id = f"anta-report-{context.task_id or 'unknown'}"
+            art.name        = "anta_report"
+            art.description = f"ANTA テストレポート ({action})"
+            art.parts.append(_Part(text=json.dumps(result, ensure_ascii=True)))
+            await event_queue.enqueue_event(art)
+            logger.info(f"[ANTA] Artifact 送出: anta_report ({action})")
+        except Exception as _e:
+            # SDK が Artifact 未対応の場合はフォールバック: 完全レポートを Message で再送
+            logger.debug(f"[ANTA] Artifact 送出スキップ（SDK非対応）: {_e}")
+            await _send_text(json.dumps(result, ensure_ascii=True))
 
     # ── action ディスパッチ ───────────────────────────────────────────────────
     async def _dispatch(

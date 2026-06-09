@@ -408,6 +408,7 @@ Phase2（commit）: 新規セッション名で configure session → commit
 
 **エージェント・プロトコル**
 - [A2A Protocol (Google)](https://github.com/google/A2A)
+- [A2A Discussions #1774 — Artifact 設計のベストプラクティス](https://github.com/a2aproject/A2A/discussions/1774)
 - [Microsoft Agent Framework](https://github.com/microsoft/agent-framework)
 
 **検証環境**

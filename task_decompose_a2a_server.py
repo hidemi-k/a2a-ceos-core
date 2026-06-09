@@ -359,37 +359,81 @@ _A2A_HEADERS = {"A2A-Version": "1.0", "Content-Type": "application/json"}
 
 
 def _extract_text(a2a_resp: dict) -> dict:
-    """A2A v1.1.0 レスポンスからテキストを取り出し JSON として返す。ネスト展開付き。"""
+    """
+    A2A v1.1.0 レスポンスからテキストを取り出し JSON として返す。
+
+    【#1774 対応】
+    message.parts（会話・要約）と artifacts（最終成果物）を両方ハンドリングする。
+    Artifact が存在する場合は _artifact_{name} キーとして parsed にマージし、
+    "result" という名前の Artifact は parsed["result"] を上書きする（成果物が正）。
+
+    既知の Artifact 名:
+      anta_report  → parsed["_artifact_anta_report"]  （ANTA テストレポート全体）
+      xdp_log      → parsed["_artifact_xdp_log"]      （XDP 統計・分析ログ）
+      report       → parsed["_artifact_report"]        （診断レポート全体）
+      diff         → parsed["_artifact_diff"]          （差分テキスト）
+    """
     try:
-        # v1.1.0: {"message": {"parts": [{"text": "..."}]}} 形式
-        parts = a2a_resp.get("message", {}).get("parts", [])
-        if not parts:
-            # 旧形式フォールバック
-            parts = a2a_resp.get("result", {}).get("parts", [])
-        if not parts:
-            parts = a2a_resp.get("result", {}).get("message", {}).get("parts", [])
+        # ── 1. Artifact を先に収集 ─────────────────────────────────────────────
+        artifact_map: dict = {}
+        for art in a2a_resp.get("artifacts", []):
+            if not isinstance(art, dict):
+                continue
+            art_name = art.get("name", "")
+            for part in art.get("parts", []):
+                text = part.get("text") if isinstance(part, dict) else None
+                if text is None:
+                    continue
+                try:
+                    artifact_map[art_name] = json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    artifact_map[art_name] = {"_raw_text": text}
+                break  # 各 Artifact の parts 先頭のみ使用
+
+        # ── 2. message.parts から会話テキスト（要約）を取得 ───────────────────
+        parts = (
+            a2a_resp.get("message", {}).get("parts", [])
+            or a2a_resp.get("result", {}).get("parts", [])
+            or a2a_resp.get("result", {}).get("message", {}).get("parts", [])
+        )
+        parsed: dict = {}
         for part in parts:
-            # v1.1.0: {"text": "..."} 形式（kind フィールドなし）
             text = part.get("text") if isinstance(part, dict) else None
             if text is None:
                 continue
             try:
                 parsed = json.loads(text)
             except (json.JSONDecodeError, TypeError):
-                return {"_raw_text": text}
-            # Hub 経由のネスト展開
+                parsed = {"_raw_text": text}
+                break
+            # Hub 経由のネスト展開（後方互換）
             inner = parsed.get("result")
             if isinstance(inner, dict) and "message" in inner:
                 parsed["result"] = _extract_text(inner)
-            return parsed
-        return {"_raw_a2a": a2a_resp}
+            break
+
+        if not parsed and not artifact_map:
+            return {"_raw_a2a": a2a_resp}
+
+        # ── 3. Artifact を parsed にマージ（Artifact が正の成果物）─────────────
+        for art_name, art_data in artifact_map.items():
+            parsed[f"_artifact_{art_name}"] = art_data
+        if "result" in artifact_map:
+            parsed["result"] = artifact_map["result"]
+
+        return parsed
+
     except Exception as e:
         return {"_parse_error": str(e)}
 
 
 async def _forward(target_url: str, payload: dict) -> dict:
+    """
+    ダウンストリームの A2A サーバへリクエストを転送し、レスポンスを返す。
+    _extract_text() が Artifact を _artifact_* キーとして展開済みの dict を返す。
+    """
     # v1.1.0: /message:send エンドポイント + A2A-Version ヘッダー必須
-    a2a_req = _make_a2a_request(payload)
+    a2a_req  = _make_a2a_request(payload)
     endpoint = target_url.rstrip("/") + "/message:send"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(endpoint, json=a2a_req, headers=_A2A_HEADERS)
@@ -710,6 +754,9 @@ async def execute(req: ExecuteRequest):
 
         # analyze アクション時は exec_tags / analysis をトップレベルに引き上げて
         # UI（app_a2a.py）が直接参照しやすくする
+        # ── #1774: _artifact_* キーをトップレベルに透過伝播 ─────────────────────
+        _artifact_passthrough = {k: v for k, v in xdp_result.items()
+                                 if k.startswith("_artifact_")}
         response = {
             "trace_id":  trace_id,
             "route":     "security",
@@ -724,6 +771,7 @@ async def execute(req: ExecuteRequest):
             # security 操作では xml/session_diff は不要
             "xml":          "",
             "session_diff": {},
+            **_artifact_passthrough,   # _artifact_xdp_log 等を透過
         }
         _trace_store[trace_id] = {
             **response,
@@ -881,6 +929,9 @@ async def execute(req: ExecuteRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+        # ── #1774: _artifact_* キーをトップレベルに透過伝播 ─────────────────────
+        _artifact_passthrough = {k: v for k, v in anta_result.items()
+                                 if k.startswith("_artifact_")}
         response = {
             "trace_id":       trace_id,
             "route":          "verify",
@@ -895,6 +946,7 @@ async def execute(req: ExecuteRequest):
             "tests_total":    anta_result.get("tests_total", 0),
             "tests_passed":   anta_result.get("tests_passed", 0),
             "tests_failed":   anta_result.get("tests_failed", 0),
+            **_artifact_passthrough,   # _artifact_anta_report 等を透過
         }
         _trace_store[trace_id] = {
             **response,
@@ -1025,6 +1077,9 @@ async def execute(req: ExecuteRequest):
     else:
         safe_result = result
 
+    # ── #1774: _artifact_* キーをトップレベルに透過伝播 ─────────────────────────
+    _artifact_passthrough = {k: v for k, v in result.items()
+                             if k.startswith("_artifact_")}
     response = {
         "trace_id":     trace_id,
         "route":        route,
@@ -1034,6 +1089,7 @@ async def execute(req: ExecuteRequest):
         "xml":          xml_out,
         "session_diff": session_diff_result,   # ★ 事前 diff（新規追加）
         "result":       safe_result,
+        **_artifact_passthrough,   # _artifact_report / _artifact_diff 等を透過
     }
 
     _trace_store[trace_id] = {
@@ -1395,6 +1451,9 @@ async def anta_snapshot(req: AntaSnapshotRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    # ── #1774: _artifact_* キーをトップレベルに透過伝播 ─────────────────────────
+    _artifact_passthrough = {k: v for k, v in result.items()
+                             if k.startswith("_artifact_")}
     response = {
         "trace_id":    trace_id,
         "route":       "verify",
@@ -1405,6 +1464,7 @@ async def anta_snapshot(req: AntaSnapshotRequest):
         "timestamp":   result.get("timestamp", ""),
         "categories":  result.get("categories", []),
         "result":      result,
+        **_artifact_passthrough,
     }
     from fastapi.responses import Response as _FResp
     return _FResp(
@@ -1443,6 +1503,9 @@ async def anta_post_check(req: AntaPostCheckRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    # ── #1774: _artifact_* キーをトップレベルに透過伝播 ─────────────────────────
+    _artifact_passthrough = {k: v for k, v in result.items()
+                             if k.startswith("_artifact_")}
     response = {
         "trace_id":       trace_id,
         "route":          "verify",
@@ -1454,6 +1517,7 @@ async def anta_post_check(req: AntaPostCheckRequest):
         "new_issues":     result.get("new_issues", []),
         "diff":           result.get("diff", {}),
         "result":         result,
+        **_artifact_passthrough,
     }
     from fastapi.responses import Response as _FResp2
     return _FResp2(

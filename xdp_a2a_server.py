@@ -772,8 +772,41 @@ class XdpFirewallExecutor(AgentExecutor):
                 logger.info(f"完了: action={result.get('action')} "
                             f"status={result.get('status')}")
 
-            await _send_text(
-                    json.dumps(result, ensure_ascii=True, indent=2))
+            # ── #1774: Message と Artifact を分離して返す ─────────────────────
+            # analyze アクションは大きな統計 JSON を含むため Artifact に分離する
+            # 書き込み計画・エラー・単純な READ 系はそのまま Message のみ
+            if result.get("action") == "analyze" and result.get("status") == "success":
+                # Message: 人間が読む要約（analysis テキスト + exec_tags）
+                summary_for_message = {
+                    "status":    result.get("status"),
+                    "action":    result.get("action"),
+                    "analysis":  result.get("analysis", ""),
+                    "exec_tags": result.get("exec_tags", []),
+                    "query":     result.get("query", query),
+                    "deploy":    result.get("deploy", deploy),
+                }
+                await _send_text(
+                        json.dumps(summary_for_message, ensure_ascii=True, indent=2))
+
+                # Artifact: 完全な統計データ（top_stats / drop_list / qos_list を含む）
+                try:
+                    from a2a.types.a2a_pb2 import Artifact as _Artifact
+                    art = _Artifact()
+                    art.artifact_id = f"xdp-log-{context.task_id or 'unknown'}"
+                    art.name        = "xdp_log"
+                    art.description = "XDP セキュリティ分析ログ（統計データ）"
+                    art.parts.append(_Part(
+                        text=json.dumps(result, ensure_ascii=True, indent=2)))
+                    await event_queue.enqueue_event(art)
+                    logger.info("[XDP] Artifact 送出: xdp_log (analyze)")
+                except Exception as _e:
+                    # フォールバック: 完全データを Message で再送
+                    logger.debug(f"[XDP] Artifact 送出スキップ（SDK非対応）: {_e}")
+                    await _send_text(
+                            json.dumps(result, ensure_ascii=True, indent=2))
+            else:
+                await _send_text(
+                        json.dumps(result, ensure_ascii=True, indent=2))
 
         except Exception as e:
             logger.error(f"executor エラー: {e}", exc_info=True)

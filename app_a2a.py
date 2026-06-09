@@ -456,34 +456,78 @@ async def xdp_get(path: str, params: dict = None):
             return {"status": "ok", "message": text[:200]}
 
 
-def _xdp_extract_text_as_json(a2a_resp: dict) -> dict:
-    """A2A v1.1.0 レスポンスから JSON を抽出する。"""
+def _extract_a2a_response(a2a_resp: dict) -> dict:
+    """
+    A2A v1.1.0 レスポンスから JSON を抽出する。
+
+    【#1774 対応】
+    Message.parts（会話テキスト・要約）と artifacts（最終成果物）を両方ハンドリングする。
+    Artifact が存在する場合は _artifact_{name} キーとしてマージし、
+    "result" Artifact はトップレベルの result を上書きする（成果物が正）。
+
+    Artifact キー命名規則:
+      artifacts[*].name == "anta_report"  → parsed["_artifact_anta_report"]
+      artifacts[*].name == "diff"         → parsed["_artifact_diff"]
+      artifacts[*].name == "xdp_log"     → parsed["_artifact_xdp_log"]
+      artifacts[*].name == "report"       → parsed["_artifact_report"]
+    """
     try:
-        # v1.1.0: {"message": {"parts": [{"text": "..."}]}} 形式
-        parts = a2a_resp.get("message", {}).get("parts", [])
-        if not parts:
-            # 旧形式フォールバック
-            result_obj = a2a_resp.get("result", {})
-            parts = result_obj.get("parts", [])
-        if not parts:
-            parts = a2a_resp.get("result", {}).get("message", {}).get("parts", [])
+        # ── 1. Artifact を先に収集（#1774: 成果物は Artifact で返すべき）──────
+        artifacts = a2a_resp.get("artifacts", [])
+        artifact_map: dict = {}
+        for art in artifacts:
+            art_name  = art.get("name", "") if isinstance(art, dict) else ""
+            art_parts = art.get("parts", []) if isinstance(art, dict) else []
+            for part in art_parts:
+                text = part.get("text") if isinstance(part, dict) else None
+                if text is None:
+                    continue
+                try:
+                    artifact_map[art_name] = json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    artifact_map[art_name] = {"_raw_text": text}
+                break  # parts の先頭だけ使用
+
+        # ── 2. message.parts から会話テキスト（要約）を取得 ───────────────────
+        parts = (
+            a2a_resp.get("message", {}).get("parts", [])
+            or a2a_resp.get("result", {}).get("parts", [])
+            or a2a_resp.get("result", {}).get("message", {}).get("parts", [])
+        )
+        parsed: dict = {}
         for part in parts:
-            # v1.1.0: {"text": "..."} 形式（kind フィールドなし）
             text = part.get("text") if isinstance(part, dict) else None
             if text is None:
                 continue
             try:
                 parsed = json.loads(text)
             except (json.JSONDecodeError, TypeError):
-                return {"_raw_text": text}
+                parsed = {"_raw_text": text}
+            # ネスト再帰（旧来の互換）
             inner = parsed.get("result")
             if isinstance(inner, dict) and "message" in inner:
-                parsed["result"] = _xdp_extract_text_as_json(inner)
-            return parsed
-        return {"status": "error", "message": "parts empty",
-                "_raw": str(a2a_resp)[:300]}
+                parsed["result"] = _extract_a2a_response(inner)
+            break
+
+        if not parsed and not artifact_map:
+            return {"status": "error", "message": "parts empty",
+                    "_raw": str(a2a_resp)[:300]}
+
+        # ── 3. Artifact を parsed にマージ（Artifact が正の成果物）─────────────
+        for art_name, art_data in artifact_map.items():
+            parsed[f"_artifact_{art_name}"] = art_data
+        # "result" という名前の Artifact はトップレベルの result を上書き
+        if "result" in artifact_map:
+            parsed["result"] = artifact_map["result"]
+
+        return parsed
+
     except Exception as e:
         return {"status": "error", "message": f"parse error: {e}"}
+
+
+# 後方互換エイリアス（既存コードが参照している箇所のため残す）
+_xdp_extract_text_as_json = _extract_a2a_response
 
 
 async def xdp_a2a_post(payload: dict) -> dict:
@@ -505,7 +549,7 @@ async def xdp_a2a_post(payload: dict) -> dict:
             )
             resp.raise_for_status()
             data = resp.json()
-        return _xdp_extract_text_as_json(data)
+        return _extract_a2a_response(data)
     except httpx.ConnectError:
         return {"status": "error",
                 "message": f"XDP A2A Server ({XDP_URL}) に接続できません"}
@@ -539,7 +583,7 @@ async def anta_a2a_post(payload: dict) -> dict:
             )
             resp.raise_for_status()
             data = resp.json()
-        return _xdp_extract_text_as_json(data)  # A2A レスポンス展開は共通
+        return _extract_a2a_response(data)  # A2A レスポンス展開は共通
     except httpx.ConnectError:
         return {"status": "error",
                 "message": f"ANTA Verify Server ({ANTA_URL}) に接続できません"}
@@ -752,6 +796,15 @@ def _parse_execute_result(result: dict) -> dict:
         #   response["status"]  = "success" | "partial_failure" | "failure" | "error"
         #   response["summary"] = "✅ 全 10 タスク成功" など
         # inner (= response["result"]) には ANTA の results/tests_total 等が入っている
+
+        # ── #1774 Artifact パス: サーバが Artifact でレポートを返した場合を優先 ──
+        # _extract_a2a_response() が _artifact_anta_report として展開済み
+        anta_report_artifact = result.get("_artifact_anta_report")
+        if anta_report_artifact and isinstance(anta_report_artifact, dict):
+            # Artifact の完全レポートを inner として使用（Message の要約より詳細）
+            inner = anta_report_artifact
+        # フォールバック: 旧来どおり result["result"] から読む（後方互換）
+
         anta_results  = inner.get("results",       [])
         tests_total   = inner.get("tests_total",   len(anta_results))
         tests_passed  = inner.get("tests_passed",  0)
@@ -817,6 +870,11 @@ def _parse_execute_result(result: dict) -> dict:
         #   response["analysis"]  = xdp_result["analysis"]  (引き上げ済み)
         #   response["exec_tags"] = xdp_result["exec_tags"] (引き上げ済み)
         #   inner (= response["result"]) にも analysis/exec_tags が入っている
+
+        # ── #1774 Artifact パス: analyze 結果を Artifact で受け取った場合を優先 ──
+        xdp_log_artifact = result.get("_artifact_xdp_log")
+        if xdp_log_artifact and isinstance(xdp_log_artifact, dict):
+            inner = xdp_log_artifact
         action    = inner.get("action", "")
         # analysis / exec_tags: トップレベル(result直下)を優先、なければ inner から取得
         _analysis  = result.get("analysis", "") or inner.get("analysis", "")
@@ -938,6 +996,13 @@ def _parse_execute_result(result: dict) -> dict:
 
     if is_read:
         # READ 系 (eAPI): safe_result に cmds/formatted が入っている
+
+        # ── #1774 Artifact パス: 診断レポートを Artifact で受け取った場合 ────────
+        report_artifact = result.get("_artifact_report") or result.get("_artifact_diff")
+        if report_artifact and isinstance(report_artifact, dict):
+            # 診断レポート Artifact の commands_executed / report を inner から補完
+            inner = {**inner, **report_artifact}
+
         cmds      = inner.get("cmds", [])
         formatted = inner.get("formatted", "")
         return {
