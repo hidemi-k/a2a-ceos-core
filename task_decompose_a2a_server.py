@@ -78,8 +78,6 @@ BUILD_DATE = "2026-05-16"
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.getenv("SASE_CONFIG",
                          os.path.join(BASE_DIR, "./config.ini"))
-GROQ_BASE_URL  = "https://api.groq.com/openai/v1"   # フォールバックログ用に残す
-DEFAULT_MODEL  = "llama-3.3-70b-versatile"
 
 A2A_HOST       = os.getenv("A2A_HOST",       "0.0.0.0")
 A2A_PORT       = int(os.getenv("A2A_PORT",   "8000"))

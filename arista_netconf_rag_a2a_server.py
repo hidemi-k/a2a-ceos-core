@@ -123,8 +123,6 @@ CONFIG_PATH = os.getenv(
     "SASE_CONFIG",
     os.path.join(BASE_DIR, "./config.ini")
 )
-GROQ_BASE_URL  = "https://api.groq.com/openai/v1"   # ログ用に残す
-DEFAULT_MODEL  = "llama-3.3-70b-versatile"
 FAISS_PATH     = os.getenv("FAISS_PATH",
                             os.path.join(BASE_DIR, "faiss_db", "arista_netconf"))
 A2A_HOST       = os.getenv("A2A_HOST", "0.0.0.0")

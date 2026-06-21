@@ -103,8 +103,6 @@ CONFIG_PATH = os.getenv(
     "SASE_CONFIG",
     os.path.join(BASE_DIR, "./config.ini"),
 )
-GROQ_BASE_URL  = "https://api.groq.com/openai/v1"
-DEFAULT_MODEL  = "llama-3.3-70b-versatile"
 
 A2A_HOST       = os.getenv("A2A_HOST",       "0.0.0.0")
 A2A_PORT       = int(os.getenv("A2A_PORT",   "8003"))
