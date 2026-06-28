@@ -1595,6 +1595,83 @@ CRITICAL ROUTING-POLICY RULES:
 - <masklength-range> は完全一致の場合 "exact"、範囲指定は "24..32" 形式
 - prefix-set だけでは BGP advertise は完結しない。policy-definition と BGP neighbor への適用も必要
 
+ACL CREATE (ACL セット作成 + deny エントリ追加):
+cEOS 実機確認済みの正しい構造。
+
+重要制約:
+- <description> と <ipv4>/<ipv6> は同時に指定不可（cEOS 制約）
+- ipv4 を使う場合は <description> を含めない
+
+```
+<config>
+  <acl xmlns="http://openconfig.net/yang/acl">
+    <acl-sets>
+      <acl-set>
+        <name>BLOCK_SRC</name>
+        <type>ACL_IPV4</type>
+        <config>
+          <name>BLOCK_SRC</name>
+          <type>ACL_IPV4</type>
+        </config>
+        <acl-entries>
+          <acl-entry>
+            <sequence-id>10</sequence-id>
+            <config>
+              <sequence-id>10</sequence-id>
+            </config>
+            <ipv4>
+              <config>
+                <source-address>10.0.5.100/32</source-address>
+              </config>
+            </ipv4>
+            <actions>
+              <config>
+                <forwarding-action>DROP</forwarding-action>
+              </config>
+            </actions>
+          </acl-entry>
+        </acl-entries>
+      </acl-set>
+    </acl-sets>
+  </acl>
+</config>
+```
+
+ACL APPLY TO INTERFACE (インターフェースへの ACL 適用):
+```
+<config>
+  <acl xmlns="http://openconfig.net/yang/acl">
+    <interfaces>
+      <interface>
+        <id>Ethernet1</id>
+        <config>
+          <id>Ethernet1</id>
+        </config>
+        <ingress-acl-sets>
+          <ingress-acl-set>
+            <set-name>BLOCK_SRC</set-name>
+            <type>ACL_IPV4</type>
+            <config>
+              <set-name>BLOCK_SRC</set-name>
+              <type>ACL_IPV4</type>
+            </config>
+          </ingress-acl-set>
+        </ingress-acl-sets>
+      </interface>
+    </interfaces>
+  </acl>
+</config>
+```
+
+CRITICAL ACL RULES:
+- forwarding-action の値: DROP を試みる。失敗する場合は ACCEPT（permit）を使用
+- Arista cEOS では OpenConfig ACL の forwarding-action に制限がある場合がある
+- source-address は必ず CIDR 形式（例: 10.0.5.100/32）
+- ACL セット作成とエントリ追加は1つの edit-config で同時に実施する
+- インターフェース適用は別タスクで実施する
+- ingress-acl-sets（受信方向）または egress-acl-sets（送信方向）を使用
+- match-condition に source-address を指定することが必須
+
 If you cannot generate XML, output ONLY: <filter/>
 """
 
